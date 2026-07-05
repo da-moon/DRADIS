@@ -345,6 +345,27 @@ pub const TIDE_ALPACA_KEY_ENV:    &str = "ALPACA_API_KEY_ID";
 pub const TIDE_ALPACA_SECRET_ENV: &str = "ALPACA_API_SECRET_KEY";
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
+// ── Sports Raptor (The Odds API line-movement feed) ──────────────────────────
+//
+/// Env var carrying the The Odds API (the-odds-api.com) key. Absent ⇒ the Sports
+/// Raptor runs idle/observe-only: it seeds a neutral snapshot, reports
+/// `sports_connected = false`, and publishes no line-movement signal.
+pub const SPORTS_ODDS_KEY_ENV: &str = "ODDS_API_KEY";
+
+/// Sport key polled by the Sports Raptor. `upcoming` returns the next games
+/// across all in-season sports — a broad, always-populated market-mood sample.
+/// Override with a specific key (e.g. `americanfootball_nfl`) for a focused feed.
+pub const SPORTS_ODDS_SPORT: &str = "upcoming";
+
+/// Comma-separated bookmaker regions for the odds query (`us`, `uk`, `eu`, `au`).
+pub const SPORTS_ODDS_REGIONS: &str = "us";
+
+/// Seconds between Sports Raptor polls. The Odds API free tier is quota-limited
+/// (~500 requests/month), so poll conservatively — line movement is a slow signal.
+pub const SPORTS_POLL_SECS: u64 = 300;
+pub const SPORTS_ODDS_LOW_BUDGET_WARN: i64 = 50;
+
+
 // ============================================================================
 // BASIS STRATEGY MAKER ORDER PARAMETERS
 // ============================================================================
@@ -524,6 +545,7 @@ pub const TRENDCAPTURE_REVERSAL_DRIFT_PCT: Decimal = dec!(0.00075);
 
 pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 1800;  // 30 min minimum
+pub const TRENDCAPTURE_MAX_SECS_TO_EXPIRY: i64 = 14400;
 pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 120;
 pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.04);
 pub const TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
@@ -546,7 +568,7 @@ pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.35);
 
 // ── TrendReversal mode (2026-06-29) ──────────────────────────────────────────
 // Fade the detected drift (buy the opposite token) instead of following it.
-pub const TRENDREVERSAL_MODE: bool = true;
+pub const TRENDREVERSAL_MODE: bool = false;  // A/B TEST: follow (invert fade). Data 07-02→03: fade 0W/9L, drift continued not reverted.
 pub const TRENDREVERSAL_EXHAUSTION_MULT: Decimal = dec!(1.0);
 pub const TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT: Decimal = dec!(0.005);
 pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.18);

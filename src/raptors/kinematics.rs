@@ -162,6 +162,16 @@ impl PriceKinematics {
         self.prev_velocity = dec!(0);
         self.price_history_10m.clear();
     }
+
+    /// The rolling 60-minute price series as `f64`, oldest first — feeds the
+    /// shared realized-volatility telemetry (`helpers::volatility`).
+    pub fn prices_60m_f64(&self) -> Vec<f64> {
+        use rust_decimal::prelude::ToPrimitive as _;
+        self.price_history_60m
+            .iter()
+            .map(|(_, p)| p.to_f64().unwrap_or(0.0))
+            .collect()
+    }
 }
 
 impl Default for PriceKinematics {

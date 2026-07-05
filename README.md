@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, and Tide "Institutional Pulse" scouts), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -135,7 +135,7 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         src/ layout                                 │
 │                                                                     │
-│  raptors/          ← Signal scouts (Binance or Hyperliquid)         │
+│  raptors/          ← Signal scouts (Binance/Hyperliquid, Odds API)  │
 │  vipers/           ← Trading strategies (8 Vipers)                  │
 │  squadron/         ← Deployment layer (Raptor+Viper+Market bundle)  │
 │  cag/              ← Commander (async dispatch, multi-asset)        │
@@ -157,6 +157,8 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 │  (Binance/Hyperliq)  │   │                      │
 │  Tide Raptor         │   │                      │
 │  (Alpaca IEX + iNAV) │   │                      │
+│  Sports Raptor       │   │                      │
+│  (The Odds API)      │   │                      │
 └──────────┬───────────┘   └───────────┬──────────┘
            │  watch channels           │ orderbook WS
            └─────────────┬─────────────┘
@@ -237,10 +239,12 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 | **Funding Raptor**             | Binance or Hyperliquid (`MARKET_DATA_SOURCE`) | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
 | **Derivatives Raptor**         | Binance or Hyperliquid (`MARKET_DATA_SOURCE`) | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
 | **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
-| *(future)* **Sports Raptor**   | Line movement APIs      | Betting line drift, public money %                      | —                        |
+| **Sports Raptor**              | The Odds API (h2h)      | Vig-free consensus probability, line drift, book dispersion — venue-neutral (US + intl), **observe-only** | `src/raptors/sports.rs` |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
 When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence); Basis, Momentum and TrendCapture use them as confirmation gates; and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
+
+The **Sports Raptor** is the first non-crypto scout: a single venue-neutral instance shared by both the US and intl pipelines. It polls The Odds API (keyed on `ODDS_API_KEY`), reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus, and broadcasts line drift + book dispersion. Like the Tide Raptor it runs **observe-only** — it publishes telemetry but no Viper consumes it for sizing yet — and degrades silently to a neutral snapshot when no API key is set.
 
 ### Market data source: Binance or Hyperliquid
 
@@ -538,6 +542,7 @@ advertised fetch/backtest/report API is unreachable dead code in the published c
 - **A paid Polygon RPC endpoint** (required for auto-settlement)
 - Telegram bot token (optional)
 - Alpaca API key/secret (optional — free tier; only needed for the **Tide Raptor**'s live IEX ETF feed. Without it the Institutional Pulse card stays idle.)
+- The Odds API key (optional — free tier; only needed for the **Sports Raptor**'s line-movement feed. Without it the Sports Raptor pill stays idle.)
 
 ### Tide Raptor (Institutional Pulse) — optional
 
@@ -554,6 +559,24 @@ ALPACA_API_SECRET_KEY=your-secret-key
 
 These feed the GBoost feature vector, the Basis tide veto, and the **Convergence**
 Viper. Omit them and those consumers simply treat the pulse as neutral/zero.
+
+### Sports Raptor (line movement) — optional
+
+The Sports Raptor is a venue-neutral, **observe-only** scout shared by both the US
+and intl pipelines. It polls [The Odds API](https://the-odds-api.com) (free tier),
+reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus
+probability, and broadcasts **line drift** (movement since the previous poll) and
+**book dispersion** (soft-line disagreement). To enable it, add your key to `.env`:
+
+```bash
+ODDS_API_KEY=your-the-odds-api-key
+```
+
+The free tier is a hard ~500 requests/month, so the raptor polls conservatively
+every 2 hours (~360 requests/month, leaving headroom). It publishes telemetry only
+— no Viper consumes it for sizing yet. The remaining monthly budget is logged each
+poll (from the API's `x-requests-remaining` header), with a loud warning when it
+runs low. Omit the key and it runs idle (neutral snapshot, offline pill).
 
 ### RPC Configuration
 
@@ -688,8 +711,8 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 - LLM live config patches via Telegram approval gate
 
 ### Longer-term
-- Sports Raptor (line movement feeds)
 - Politics Raptor (polling aggregator feeds)
+- Sports Viper — a dedicated strategy that consumes the Sports Raptor's line-movement signal (currently observe-only)
 
 ---
 
