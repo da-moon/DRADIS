@@ -46,6 +46,8 @@ use dradis::venues::intl::IntlClobVenue;
 use dradis::helpers::dynamic_config::DynamicConfig;
 use dradis::api::server::AssetRaptorHealth;
 #[cfg(feature = "intl_clob")]
+use dradis::raptors::source::MarketDataSource;
+#[cfg(feature = "intl_clob")]
 use tokio_util::sync::CancellationToken;
 
 use dradis::helpers::{
@@ -431,6 +433,12 @@ async fn main() -> Result<()> {
     // Store first asset's session for LLM Advisor (P&L tracking reference)
     let mut primary_session: Option<SessionState> = None;
 
+    // Resolve the market-data source ONCE (env MARKET_DATA_SOURCE → config →
+    // Binance). Logged a single time here; the per-asset spawn below branches on
+    // it. Default (unset) keeps the three Binance raptors byte-identical.
+    let market_data_source = MarketDataSource::resolve();
+    info!(" Market data source: {}", market_data_source.as_str());
+
     for asset in assets.iter() {
         // ── Per-asset raptor signal feeds ─────────────────────────────────────
         let (oracle_tx, oracle_rx)     = watch::channel(dec!(0));
@@ -440,18 +448,35 @@ async fn main() -> Result<()> {
         let (deriv_tx, deriv_rx)       =
             watch::channel(dradis::raptors::derivatives::DerivativesSnapshot::default());
 
-        tokio::spawn(dradis::raptors::price::run_price_raptor(
-            asset.clone(), oracle_tx, velocity_tx, drift_tx,
-            Arc::clone(&raptor_health_tx),
-        ));
-        tokio::spawn(dradis::raptors::funding::run_funding_raptor(
-            Arc::clone(&shared_http), asset.clone(), funding_tx,
-            Arc::clone(&raptor_health_tx),
-        ));
-        tokio::spawn(dradis::raptors::derivatives::run_derivatives_raptor(
-            Arc::clone(&shared_http), asset.clone(), deriv_tx,
-            Arc::clone(&raptor_health_tx),
-        ));
+        // ── Source-selected raptor spawn ──────────────────────────────────────
+        // Binance: three independent tasks (price WS + funding REST + OI/CVD
+        //          REST) — byte-identical to the pre-abstraction behavior.
+        // Hyperliquid: one WS task per asset feeding all five channels.
+        match market_data_source {
+            MarketDataSource::Binance => {
+                tokio::spawn(dradis::raptors::price::run_price_raptor(
+                    asset.clone(), oracle_tx, velocity_tx, drift_tx,
+                    Arc::clone(&raptor_health_tx),
+                ));
+                tokio::spawn(dradis::raptors::funding::run_funding_raptor(
+                    Arc::clone(&shared_http), asset.clone(), funding_tx,
+                    Arc::clone(&raptor_health_tx),
+                ));
+                tokio::spawn(dradis::raptors::derivatives::run_derivatives_raptor(
+                    Arc::clone(&shared_http), asset.clone(), deriv_tx,
+                    Arc::clone(&raptor_health_tx),
+                ));
+            }
+            #[cfg(feature = "hyperliquid")]
+            MarketDataSource::Hyperliquid => {
+                tokio::spawn(dradis::raptors::hyperliquid::run_hyperliquid_raptor(
+                    asset.clone(), oracle_tx, velocity_tx, drift_tx, funding_tx, deriv_tx,
+                    Arc::clone(&raptor_health_tx),
+                ));
+            }
+            #[cfg(not(feature = "hyperliquid"))]
+            MarketDataSource::Hyperliquid => unreachable!("resolve() falls back to Binance without the `hyperliquid` feature"),
+        }
 
         // Tide Raptor — "Institutional Pulse" from spot-BTC-ETF premium. BTC-only
         // and singular: spawned for the btc asset, reusing its live oracle feed.

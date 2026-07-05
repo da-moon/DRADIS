@@ -61,7 +61,6 @@ use crate::venues::core::MarketId;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
-use chrono::Utc;
 use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -123,7 +122,7 @@ impl Strategy for TrendReversalStrategyImpl {
         };
 
         // ── Snapshot staleness gate ───────────────────────────────────────────
-        let snap_age = (Utc::now() - snap.timestamp).num_seconds();
+        let snap_age = (ctx.wall_now - snap.timestamp).num_seconds();
         if snap_age > config::TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS {
             debug!(" TrendCapture blocked: snapshot stale ({}s > {}s)",
                 snap_age, config::TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS);
@@ -141,7 +140,7 @@ impl Strategy for TrendReversalStrategyImpl {
 
         // ── Expiry guard ──────────────────────────────────────────────────────
         let secs_left = if let Some(close_time) = market.market_close_time {
-            let s = (close_time - Utc::now()).num_seconds();
+            let s = (close_time - ctx.wall_now).num_seconds();
             if s < config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY {
                 debug!(" TrendCapture blocked: only {}s to expiry (min {}s)",
                     s, config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY);
@@ -162,7 +161,7 @@ impl Strategy for TrendReversalStrategyImpl {
         };
 
         // ── Market warmup gate ────────────────────────────────────────────────
-        let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
+        let secs_since_market_start = (ctx.wall_now - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::TRENDCAPTURE_MARKET_WARMUP_SECS {
             return Ok(StrategySignal::NoSignal);
         }
@@ -228,7 +227,10 @@ impl Strategy for TrendReversalStrategyImpl {
         // of in-memory state. Runs only when |drift_10m| clears the entry trigger
         // (rare), so the query is cheap. Placed before the std-mutex cooldown locks
         // below so no guard is held across this await.
-        if config::TRENDREVERSAL_MODE {
+        // Skip the persistent guard under replay: the backtest harness shares the
+        // process DB pool registry, so this query would consult the LIVE bot's
+        // stop-loss history (read-only, but a fidelity leak). See ctx.is_replay.
+        if config::TRENDREVERSAL_MODE && !ctx.is_replay {
             let intended_side = if drift_10m <= bear_drift_10m_thr {
                 Some("YES")   // drift DOWN → fade UP → buy YES
             } else if drift_10m >= bull_drift_10m_thr {
@@ -423,7 +425,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 let token_id = buy_token;
                 let cdl = effective_cooldown(&market.condition_id);
                 let in_cooldown = cooldowns.get(&token_id)
-                    .map(|t| t.elapsed().as_secs() < cdl)
+                    .map(|t| ctx.mono_now.duration_since(*t).as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
@@ -489,7 +491,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 let token_id = buy_token;
                 let cdl = effective_cooldown(&market.condition_id);
                 let in_cooldown = cooldowns.get(&token_id)
-                    .map(|t| t.elapsed().as_secs() < cdl)
+                    .map(|t| ctx.mono_now.duration_since(*t).as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
@@ -536,7 +538,7 @@ impl Strategy for TrendReversalStrategyImpl {
         let soft_exit_cooldown_active = {
             let last = self.last_exit_signal_at.lock().unwrap();
             match *last {
-                Some(t) => t.elapsed().as_secs() < config::TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS,
+                Some(t) => ctx.mono_now.duration_since(t).as_secs() < config::TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS,
                 None => false,
             }
         };
@@ -558,7 +560,7 @@ impl Strategy for TrendReversalStrategyImpl {
 
         // Dynamic SL: tighter in the last hour before expiry
         let secs_left_opt = market.market_close_time
-            .map(|ct| (ct - Utc::now()).num_seconds());
+            .map(|ct| (ct - ctx.wall_now).num_seconds());
         // Tradelog/reason tag reflecting the active thesis.
         let tag = if config::TRENDREVERSAL_MODE { "TrendReversal" } else { "TrendCapture" };
 
@@ -612,7 +614,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 let avg_entry = position.avg_entry;
                 if avg_entry <= dec!(0) { continue; }
 
-                let secs_held = (Utc::now() - position.opened_at).num_seconds();
+                let secs_held = (ctx.wall_now - position.opened_at).num_seconds();
 
                 // Wait for fill confirmation before any non-catastrophic exit
                 if position.fill_confirmed_at.is_none() {
@@ -656,7 +658,7 @@ impl Strategy for TrendReversalStrategyImpl {
 
                 // Near-expiry forced exit
                 if let Some(close_time) = market.market_close_time {
-                    let secs_left = (close_time - Utc::now()).num_seconds();
+                    let secs_left = (close_time - ctx.wall_now).num_seconds();
                     let net_profit = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
                     if secs_left <= config::TRENDCAPTURE_EXPIRY_EXIT_SECS
                         && net_profit < config::TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD
@@ -720,10 +722,10 @@ impl Strategy for TrendReversalStrategyImpl {
         };
 
         if let Some(p) = pending {
-            self.record_exit(&p.token_id, &p.condition_id, p.is_sl);
+            self.record_exit(&p.token_id, &p.condition_id, p.is_sl, ctx.mono_now);
             // Stamp the exit signal cooldown to prevent FAK-miss re-fire storm
             if let Ok(mut last) = self.last_exit_signal_at.lock() {
-                *last = Some(Instant::now());
+                *last = Some(ctx.mono_now);
             }
             return Ok(StrategySignal::Exit {
                 params: OrderParams {
@@ -759,9 +761,9 @@ impl TrendReversalStrategyImpl {
     /// Record exit time for post-exit cooldown tracking.
     /// If `is_sl` is true, increments the consecutive-loss counter for the
     /// given condition_id; a TP exit resets it.
-    fn record_exit(&self, token_id: &MarketId, condition_id: &str, is_sl: bool) {
+    fn record_exit(&self, token_id: &MarketId, condition_id: &str, is_sl: bool, mono_now: Instant) {
         if let Ok(mut map) = self.post_exit_cooldown.lock() {
-            map.insert(token_id.clone(), Instant::now());
+            map.insert(token_id.clone(), mono_now);
         }
         if let Ok(mut losses) = self.consecutive_losses.lock() {
             if is_sl {

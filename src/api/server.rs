@@ -251,6 +251,11 @@ pub struct ApiState {
     /// Populated by the telemetry sampler task; served by
     /// GET /api/telemetry/history so the UI survives reloads and can scrub.
     pub telemetry_history: TelemetryHistory,
+    /// In-memory backtest run registry (feature-gated). Backs POST /api/backtest/run
+    /// and the two GET /api/backtest/runs endpoints. Compiled ONLY under
+    /// `--features backtest`, so the default server build is byte-identical.
+    #[cfg(feature = "backtest")]
+    pub backtest_registry: crate::api::backtest_api::BacktestRegistry,
 }
 
 // ─── API-key middleware ──────────────────────────────────────────────────────
@@ -403,6 +408,19 @@ async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
         Ok(new_cfg) => {
             // Broadcast to all strategy tick loops.
             let _ = s.config_tx.send(new_cfg.clone());
+            // Fan the same merge-patch out to every squadron's persisted config so
+            // running intl squadrons pick up the operator's edit on their next
+            // periodic reload (see SQUADRON_CONFIG_RELOAD_SECS in
+            // squadron::patrol_impl) — the global row alone never reaches them.
+            // A merge-patch carries only the keys the operator changed, so applying
+            // it per-squadron preserves each squadron's other (untouched) tuning.
+            if let Some(pool) = db::pool() {
+                for sid in db::squadron_config_list(pool).await {
+                    if let Err(e) = DynamicConfig::apply_squadron_patch(&sid, &body).await {
+                        warn!("Error fanning PATCH /api/config out to squadron {}: {}", sid, e);
+                    }
+                }
+            }
             match serde_json::to_value(new_cfg.as_ref()) {
                 Ok(val) => {
                     debug!("Successfully processed PATCH /api/config");
@@ -550,8 +568,23 @@ struct StatusResponse {
     strategy_markets: HashMap<String, String>,
     /// RFC-3339 timestamp of the current session start (= process startup).
     session_started_at: String,
-    /// Per-asset Binance Raptor connection health.
+    /// Per-asset Raptor connection health.
     raptors: HashMap<String, AssetRaptorHealth>,
+    /// Active market-data source ("binance" | "hyperliquid"). Drives the
+    /// source labels in the Control Tower Raptor/telemetry panels.
+    market_data_source: String,
+    /// Realized paper (ghost) session P&L across all squadrons (Decimal string).
+    /// Segregated from live P&L — see SessionState::paper_pnl.
+    paper_pnl: String,
+    /// Simulated paper collateral balance across all squadrons (Decimal string).
+    paper_balance: String,
+    /// Effective LLM Advisor provider ("ollama" | "anthropic" | "openai" |
+    /// "openai-compatible" | "chatgpt"), resolved the same way the live advisor
+    /// resolves its settings. Never any key material.
+    llm_provider: String,
+    /// Effective LLM Advisor model tag (e.g. "llama3.2", "claude-3-5-sonnet-latest").
+    /// Empty when a cloud provider is selected but no model is configured yet.
+    llm_model: String,
 }
 
 async fn get_status(State(s): State<ApiState>) -> Response {
@@ -559,8 +592,59 @@ async fn get_status(State(s): State<ApiState>) -> Response {
     let markets = s.markets_rx.borrow().clone();
     let raptors = s.raptor_health_rx.borrow().clone();
     let session_started_at = db::current_session_id().to_string();
+    let market_data_source = crate::raptors::source::MarketDataSource::resolve().as_str().to_string();
+
+    // Aggregate the paper ledger across every registered squadron session so the
+    // Control Tower can render paper P&L + balance alongside the live figures.
+    let mut paper_pnl = rust_decimal::Decimal::ZERO;
+    let mut paper_balance = rust_decimal::Decimal::ZERO;
+    for asset in s.cag.asset_names() {
+        if let Some(session) = s.cag.session_for_asset(&asset) {
+            paper_pnl += *session.paper_pnl.lock().await;
+            paper_balance += *session.paper_balance.lock().await;
+        }
+    }
+
+    // Resolve the effective LLM provider/model the same way the live advisor does
+    // (env → compile-time config precedence). The key is never read into the response;
+    // even when settings resolution fails (e.g. a cloud provider without LLM_MODEL) we
+    // still surface the resolved provider name with an empty model.
+    //
+    // Resolve ONCE and cache: the env-derived settings do not change over the process
+    // lifetime, and `resolve_from_env` logs an `error!` when `LLM_PROVIDER` is misconfigured
+    // (falling back to Ollama). Without caching, every 30s status poll would re-emit that
+    // ERROR line, flooding the level operators alert on. The value is process-global and
+    // key-free, so a `OnceLock` is safe.
+    static LLM_STATUS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    let (llm_provider, llm_model) = LLM_STATUS
+        .get_or_init(|| {
+            match crate::helpers::llm_client::LlmSettings::resolve_from_env() {
+                Ok(settings) => (settings.provider.as_str().to_string(), settings.model.clone()),
+                Err(_) => {
+                    let provider = std::env::var("LLM_PROVIDER")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .map(|v| crate::helpers::llm_client::LlmProvider::from_str(&v))
+                        .unwrap_or_else(|| {
+                            crate::helpers::llm_client::LlmProvider::from_str(crate::config::LLM_PROVIDER)
+                        });
+                    (provider.as_str().to_string(), String::new())
+                }
+            }
+        })
+        .clone();
+
     debug!("Successfully retrieved status");
-    Json(StatusResponse { strategy_markets: markets, session_started_at, raptors }).into_response()
+    Json(StatusResponse {
+        strategy_markets: markets,
+        session_started_at,
+        raptors,
+        market_data_source,
+        paper_pnl: paper_pnl.to_string(),
+        paper_balance: paper_balance.to_string(),
+        llm_provider,
+        llm_model,
+    }).into_response()
 }
 
 /// GET /api/telemetry
@@ -906,6 +990,7 @@ async fn manual_exit(
         shares,
         pnl,
         "Manual RTB (Return to Base)".to_string(),
+        false,
     ).await;
 
     // ── Step 7: Close position in DB ───────────────────────────────────────────
@@ -1074,6 +1159,13 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
         let mut deduped_positions: std::collections::HashMap<String, db::OpenPositionRow> =
             std::collections::HashMap::new();
         for pos in db::get_open_positions(&pool).await {
+            // D7: GHOST (paper) rows are segregated from the LIVE portfolio aggregation
+            // (positions_value / unrealized P&L / position_count). GET /api/positions
+            // still returns them (badged) for the Control Tower; only this live-money
+            // rollup excludes them.
+            if pos.ghost_mode {
+                continue;
+            }
             // Skip UNCONFIRMED phantoms: still `status='pending'` AND not chain-adopted
             // means the order was placed but never confirmed on-chain (never filled or
             // rejected). Valuing it inflates the portfolio with non-existent profit until
@@ -1379,7 +1471,7 @@ pub async fn run_api_server(
     // Server-side ring buffer for Raptor signal telemetry (durable across reloads).
     let telemetry_history: TelemetryHistory = Arc::new(Mutex::new(HashMap::new()));
 
-    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx: raptor_health_rx.clone(), api_key, read_only, #[cfg(feature = "intl_clob")] safe_address, cag, telemetry_history: telemetry_history.clone() };
+    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx: raptor_health_rx.clone(), api_key, read_only, #[cfg(feature = "intl_clob")] safe_address, cag, telemetry_history: telemetry_history.clone(), #[cfg(feature = "backtest")] backtest_registry: crate::api::backtest_api::BacktestRegistry::new() };
 
     // Spawn the telemetry sampler — snapshots live Raptor signals into the ring
     // buffer every TELEMETRY_SAMPLE_SECS so the Control Tower has durable,
@@ -1421,6 +1513,14 @@ pub async fn run_api_server(
     let protected_routes = protected_routes
         .route("/api/positions/sync",        axum::routing::post(sync_positions))
         .route("/api/positions/manual-exit", axum::routing::post(manual_exit));
+
+    // Backtest endpoints (feature-gated). Absent from the default build so the
+    // Control Tower probes GET /api/backtest/runs and hides its Backtest tab on 404.
+    #[cfg(feature = "backtest")]
+    let protected_routes = protected_routes
+        .route("/api/backtest/run",       axum::routing::post(crate::api::backtest_api::run_backtest_handler))
+        .route("/api/backtest/runs",      get(crate::api::backtest_api::list_runs_handler))
+        .route("/api/backtest/runs/{id}", get(crate::api::backtest_api::get_run_handler));
 
     let protected_routes = protected_routes
         // API-key check applied to all matched routes (inner layer — runs after CORS).

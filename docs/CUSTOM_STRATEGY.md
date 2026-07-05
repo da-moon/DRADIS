@@ -8,7 +8,7 @@ This guide walks through implementing and integrating a new trading strategy int
 
 Every 50ms the main loop:
 
-1. Reads the latest `MarketSnapshot` (Polymarket prices + Binance oracle data).
+1. Reads the latest `MarketSnapshot` (Polymarket prices + oracle data from the configured market-data source).
 2. Builds a `StrategyContext` containing everything needed to make a decision.
 3. Calls `execute_strategies_concurrent()` — runs **all** strategies' `evaluate_exit()` and `evaluate_entry()` concurrently.
 4. Collects the returned `StrategySignal` (which now contains full `OrderParams`).

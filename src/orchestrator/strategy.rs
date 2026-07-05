@@ -9,6 +9,7 @@ use rust_decimal::Decimal;
 use crate::state::{MarketConfig, MarketSnapshot, StrategySignal, StrategyStatus, PositionMap};
 use crate::helpers::dynamic_config::DynamicConfig;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 /// Context passed to strategies containing all market data and shared state they need.
@@ -51,6 +52,35 @@ pub struct StrategyContext {
     /// the lock and refuse to open a second pair on the same market (hold-to-settle,
     /// no churn). `None` for venues/tests that don't supply it.
     pub arb_market_lockouts: Option<crate::state::ArbMarketLockouts>,
+    /// Clock seam — wall-clock "now" for this tick.
+    ///
+    /// In production this is `Utc::now()` captured at snapshot-build time, so every
+    /// viper gate reads a single consistent wall clock instead of calling
+    /// `Utc::now()` itself (behaviour-identical, captured microseconds earlier). The
+    /// backtest harness overrides it with the replayed HISTORICAL timestamp so
+    /// warmup/staleness/expiry/hold-time gates evaluate against the historical clock
+    /// at any replay speed. Vipers MUST read this instead of `chrono::Utc::now()`
+    /// inside `evaluate_entry`/`evaluate_exit`.
+    pub wall_now: DateTime<Utc>,
+    /// Clock seam — monotonic "now" for this tick.
+    ///
+    /// In production this is `std::time::Instant::now()` captured at snapshot-build
+    /// time; the backtest harness maps it onto a synthetic monotonic timeline
+    /// (`base + (t - t0)`) so per-viper cooldown timers (stored as `Instant`s)
+    /// measure historical elapsed time under replay. Vipers MUST read this instead
+    /// of `std::time::Instant::now()` inside their evaluate paths, and MUST stamp
+    /// cooldown state with it so the later comparison is consistent.
+    pub mono_now: Instant,
+    /// Replay-isolation flag — `false` in production (default), `true` only under the
+    /// backtest harness.
+    ///
+    /// When `true`, vipers MUST NOT consult the LIVE bot's persistent SQLite state
+    /// (e.g. TrendReversal's cross-restart cascade guard reads the live trades table).
+    /// An in-process replay run shares the process's DB pool registry, so an unguarded
+    /// lookup would leak the live stop-loss history into the simulation — read-only, but
+    /// a fidelity leak. Production behaviour with `false` is byte-identical to before this
+    /// flag existed.
+    pub is_replay: bool,
 }
 
 /// Trait that all strategies must implement.

@@ -179,6 +179,12 @@ async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
     let mut deduped_by_token: std::collections::HashMap<String, db::OpenPositionRow> =
         std::collections::HashMap::new();
     for pos in positions {
+        // D7: GHOST (paper) rows are segregated from the LIVE portfolio value / equity
+        // curve. Marking them into total_value would commingle simulated exposure with
+        // real wallet collateral in pnl_snapshots and the PnlChart.
+        if pos.ghost_mode {
+            continue;
+        }
         // Skip UNCONFIRMED phantoms: a row that is still `status='pending'` AND has
         // not been chain-adopted represents an order we placed but the chain never
         // confirmed (never filled, or rejected). Marking these to market for up to
@@ -248,6 +254,14 @@ pub fn spawn_status_task(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
+        // Heartbeat oracle label reflects the active market-data source. On
+        // Binance it stays the literal `Binance:` so tools/session_parser.py
+        // keeps parsing it; Hyperliquid deployments print `Oracle:` in the same
+        // numeric format. Resolved once per task (not per tick).
+        let oracle_label = match crate::raptors::source::MarketDataSource::resolve() {
+            crate::raptors::source::MarketDataSource::Binance => "Binance",
+            crate::raptors::source::MarketDataSource::Hyperliquid => "Oracle",
+        };
         let mut ticker = interval(Duration::from_secs(60));
         ticker.tick().await;
         loop {
@@ -273,8 +287,8 @@ pub fn spawn_status_task(
                     info!(
                         " Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | \
                          Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | \
-                         Binance: ${:.2} | OBI Y={:.2} N={:.2}",
-                        ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi,
+                         {}: ${:.2} | OBI Y={:.2} N={:.2}",
+                        ya + na, ya, na, yb + nb, yb, nb, oracle_label, *oracle_rx.borrow(), yes_obi, no_obi,
                     );
 
                     // Refresh live pUSD balance so strategies can self-gate on insufficient funds.
@@ -346,6 +360,11 @@ pub fn spawn_cleanup_task(
     tg_token:             String,
     tg_chat_id:           String,
     asset:                String,
+    // D6/D7: paper settlement + segregated ledger inputs.
+    oracle_rx:            watch::Receiver<Decimal>,
+    hourly_strike_price:  Option<Decimal>,
+    paper_pnl:            Arc<Mutex<Decimal>>,
+    paper_balance:        Arc<Mutex<Decimal>>,
     cancel:               CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -360,12 +379,19 @@ pub fn spawn_cleanup_task(
                     // Returns the list of confirmed-fill orphans so we can attempt FAK sells
                     // OUTSIDE the timeout — sell latency does not count against the 45 s cap.
                     let orphan_exits = match tokio::time::timeout(Duration::from_secs(45), async {
+                        let oracle_now = *oracle_rx.borrow();
                         if hourly_yes_token != crate::venues::intl::market_id_from_u256(U256::ZERO) {
                             crate::tasks::cleanup::cleanup_expired_positions(
                                 Arc::clone(&positions),
                                 hourly_market_name.clone(),
                                 hourly_yes_token.clone(), hourly_no_token.clone(),
                                 hourly_market_close_time,
+                                hourly_strike_price,
+                                oracle_now,
+                                Arc::clone(&paper_pnl),
+                                Arc::clone(&paper_balance),
+                                asset.clone(),
+                                false,
                             ).await;
                         }
                         if let Some(ref mk) = maker_market_config {
@@ -374,6 +400,12 @@ pub fn spawn_cleanup_task(
                                 mk.market_name.clone(),
                                 mk.yes_token.clone(), mk.no_token.clone(),
                                 mk.market_close_time,
+                                mk.strike_price,
+                                oracle_now,
+                                Arc::clone(&paper_pnl),
+                                Arc::clone(&paper_balance),
+                                asset.clone(),
+                                false,
                             ).await;
                         }
 
@@ -410,9 +442,55 @@ pub fn spawn_cleanup_task(
                     // Priority 1 — RE-HEDGE: buy the MISSING leg at its current ask (FAK).
                     // Priority 2 — BID-BASED EXIT: sell the orphan at (current_bid − offset).
                     //
-                    // GHOST_MODE guard: neither path places live orders in ghost mode.
-                    if !config::GHOST_MODE {
+                    // Position-scoped: ghost (paper) legs get a simulated bid-priced close;
+                    // live legs get the unchanged re-hedge / FAK-sell logic below.
+                    {
                         for orphan in orphan_exits {
+                            // GHOST (paper) orphan: close via a simulated bid-priced exit (D4/D7)
+                            // instead of a live re-hedge/FAK-sell, then record + close the DB row.
+                            if orphan.ghost {
+                                let maker_yes_match = maker_market_config.as_ref().is_some_and(|mkc| mkc.yes_token == orphan.token_id);
+                                let maker_no_match = maker_market_config.as_ref().is_some_and(|mkc| mkc.no_token == orphan.token_id);
+                                let (orphan_bid, orphan_bid_depth) = if orphan.token_id == hourly_yes_token {
+                                    let (b, bd, _, _, _) = *yes_price_rx.borrow(); (b, bd)
+                                } else if orphan.token_id == hourly_no_token {
+                                    let (b, bd, _, _, _) = *no_price_rx.borrow(); (b, bd)
+                                } else if let (true, Some(rx)) = (maker_yes_match, maker_yes_price_rx.as_ref()) {
+                                    let (b, bd, _, _, _) = *rx.borrow(); (b, bd)
+                                } else if let (true, Some(rx)) = (maker_no_match, maker_no_price_rx.as_ref()) {
+                                    let (b, bd, _, _, _) = *rx.borrow(); (b, bd)
+                                } else { (dec!(0), dec!(0)) };
+                                let base = if orphan_bid > dec!(0) {
+                                    (orphan_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE)
+                                } else {
+                                    config::MIN_SELL_LIMIT_PRICE
+                                };
+                                let exit_avg = crate::helpers::paper::simulate_taker_sell_avg(
+                                    base, orphan_bid_depth, orphan.shares,
+                                    config::PAPER_OVERFLOW_SLIPPAGE, config::MIN_SELL_LIMIT_PRICE,
+                                );
+                                let pnl = (exit_avg - orphan.original_entry) * orphan.shares;
+                                *paper_pnl.lock().await += pnl;
+                                *paper_balance.lock().await += exit_avg * orphan.shares;
+                                let side = if orphan.token_id == hourly_yes_token
+                                    || maker_market_config.as_ref().is_some_and(|mkc| mkc.yes_token == orphan.token_id) { "YES" } else { "NO" };
+                                let market = if orphan.token_id == hourly_yes_token || orphan.token_id == hourly_no_token {
+                                    hourly_market_name.clone()
+                                } else {
+                                    maker_market_config.as_ref().map(|mkc| mkc.market_name.clone()).unwrap_or_else(|| hourly_market_name.clone())
+                                };
+                                warn!("👻 [PAPER] ORPHAN CLOSE [{}]: {:.2} shares of token {} @ ${:.4} (simulated bid exit) pnl=${:.4}",
+                                      orphan.strategy, orphan.shares, orphan.token_id, exit_avg, pnl);
+                                metrics::record_trade(
+                                    &asset, orphan.strategy.clone(), market, side.to_string(),
+                                    orphan.original_entry, exit_avg, orphan.shares, pnl,
+                                    "Orphan close (paper bid exit)".to_string(), true,
+                                ).await;
+                                if let Some(pool) = db::pool_for(&asset) {
+                                    db::close_open_position(&pool, &orphan.strategy, &orphan.token_id.to_string()).await;
+                                }
+                                continue;
+                            }
                             // Slice 2b: OrphanExit and market tokens are all neutral MarketId.
                             let vc = if orphan.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                             let mut rehedged = false;
@@ -549,6 +627,7 @@ pub fn spawn_cleanup_task(
                                                                         "ArbitrageStrategy".to_string(),
                                                                         rh_tid.clone(), rh_mkt.clone(), rh_sd.clone(),
                                                                         rh_ep, rh_sh,
+                                                                        false,
                                                                     ).await;
                                                                 } else {
                                                                     warn!("⚠️ ORPHAN RE-HEDGE: FAK order accepted but fill not confirmed on-chain — removing pending position");
@@ -749,6 +828,7 @@ pub fn spawn_lifecycle_task(
                                 shares,
                                 pnl,
                                 "LifecycleFlatten".to_string(),
+                                false,
                             ).await;
                         });
                     }

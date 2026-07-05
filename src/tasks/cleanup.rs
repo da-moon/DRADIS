@@ -217,36 +217,118 @@ async fn execute_via_safe<P: Provider + Clone>(
 }
 
 /// Remove all positions for a market that has expired or is expiring within 60s.
+///
+/// D6: before dropping expired positions, GHOST positions are settled at their binary
+/// payout ($1 if the market resolved in the token's favour, else $0) judged from the
+/// last known oracle price vs the market strike, booking realized paper P&L and the
+/// paper collateral credit and recording the settlement trade. LIVE positions keep the
+/// prior behaviour exactly — silently dropped here; on-chain settlement is owned by
+/// `auto_settle_closed_positions`.
+#[allow(clippy::too_many_arguments)]
 pub async fn cleanup_expired_positions(
     positions: Arc<Mutex<PositionMap>>,
     market_name: String,
     yes_token: MarketId,
     no_token: MarketId,
     close_time: Option<DateTime<Utc>>,
+    strike_price: Option<Decimal>,
+    oracle_price: Decimal,
+    paper_pnl: Arc<Mutex<Decimal>>,
+    paper_balance: Arc<Mutex<Decimal>>,
+    asset: String,
+    // When true (market-rotation teardown), settle & drop ghost legs regardless of the
+    // 60s close window and touch ONLY ghost positions (live legs are left in the map,
+    // grandfathered / settled on-chain). When false, the normal window-gated behaviour
+    // that also drops expired live positions is preserved exactly.
+    force: bool,
 ) {
-    let mut pos_map = positions.lock().await;
     let now = Utc::now();
 
     // Slice 2b: positions are keyed by the neutral MarketId directly.
     let yes_market = yes_token;
     let no_market = no_token;
 
-    if let Some(ct) = close_time {
-        let is_expired = ct <= now;
-        let is_expiring_soon = (ct - now).num_seconds() < 60;
+    // Ghost settlements collected while the map lock is held, then booked after it is
+    // released (record_trade/close_open_position are async DB writes).
+    struct GhostSettlement {
+        strategy: String,
+        token: MarketId,
+        side: &'static str,
+        avg_entry: Decimal,
+        shares: Decimal,
+        payout: Decimal,
+    }
+    let mut ghost_settlements: Vec<GhostSettlement> = Vec::new();
 
-        if is_expired || is_expiring_soon {
-            let before = pos_map.len();
-            pos_map.retain(|(_, token), _| token != &yes_market && token != &no_market);
-            let removed = before - pos_map.len();
+    {
+        let mut pos_map = positions.lock().await;
 
-            if removed > 0 {
-                warn!(" Cleaned up {} position(s) for market \"{}\" (expires {})",
-                    removed,
-                    market_name,
-                    if is_expired { "NOW" } else { "in <60s" }
-                );
+        if let Some(ct) = close_time {
+            let is_expired = ct <= now;
+            let is_expiring_soon = (ct - now).num_seconds() < 60;
+
+            if force || is_expired || is_expiring_soon {
+                // Settle ghost positions at binary payout before the retain drops them.
+                for ((strategy, token), pos) in pos_map.iter() {
+                    if (token != &yes_market && token != &no_market) || !pos.ghost {
+                        continue;
+                    }
+                    let is_yes = token == &yes_market;
+                    let payout = crate::helpers::paper::binary_settlement_payout(is_yes, oracle_price, strike_price);
+                    ghost_settlements.push(GhostSettlement {
+                        strategy: strategy.clone(),
+                        token: token.clone(),
+                        side: if is_yes { "YES" } else { "NO" },
+                        avg_entry: pos.avg_entry,
+                        shares: pos.shares,
+                        payout,
+                    });
+                }
+
+                let before = pos_map.len();
+                if force {
+                    // Rotation teardown: drop ONLY the ghost legs for this market; live
+                    // positions stay in the shared map (on-chain settlement owns them).
+                    pos_map.retain(|(_, token), pos| {
+                        !((token == &yes_market || token == &no_market) && pos.ghost)
+                    });
+                } else {
+                    pos_map.retain(|(_, token), _| token != &yes_market && token != &no_market);
+                }
+                let removed = before - pos_map.len();
+
+                if removed > 0 {
+                    warn!(" Cleaned up {} position(s) for market \"{}\" (expires {})",
+                        removed,
+                        market_name,
+                        if force { "rotation" } else if is_expired { "NOW" } else { "in <60s" }
+                    );
+                }
             }
+        }
+    }
+
+    // Book paper P&L + collateral and record settlement trades for the ghost legs.
+    for s in ghost_settlements {
+        let pnl = (s.payout - s.avg_entry) * s.shares;
+        *paper_pnl.lock().await += pnl;
+        *paper_balance.lock().await += s.payout * s.shares;
+        info!("👻 [PAPER] EXPIRY SETTLEMENT [{}]: {} {} | {:.2} shares @ entry ${:.4} → payout ${:.2} → pnl ${:.4} (simulated)",
+              s.strategy, market_name, s.side, s.shares, s.avg_entry, s.payout, pnl);
+        crate::helpers::metrics::record_trade(
+            &asset,
+            s.strategy.clone(),
+            market_name.clone(),
+            s.side.to_string(),
+            s.avg_entry,
+            s.payout,
+            s.shares,
+            pnl,
+            "expiry_settlement_sim".to_string(),
+            true,
+        ).await;
+        if let Some(pool) = db::pool_for(&asset) {
+            db::close_open_position(&pool, &s.strategy, &s.token.to_string()).await;
         }
     }
 }
@@ -292,6 +374,13 @@ pub struct OrphanExit {
     ///   re_hedge_cost = paired_ask + original_entry
     /// If re_hedge_cost < RE_HEDGE_THRESHOLD the arb is still profitable.
     pub original_entry: Decimal,
+    /// True when the orphaned leg was opened in paper (ghost) mode. Ghost orphans
+    /// are closed via a simulated bid-priced exit in the cleanup task rather than a
+    /// live re-hedge/FAK-sell.
+    pub ghost: bool,
+    /// Strategy that owns the orphaned leg — needed to record/close the simulated
+    /// ghost exit against the correct (strategy, token) DB row.
+    pub strategy: String,
 }
 
 pub async fn reconcile_orphaned_positions(
@@ -451,6 +540,8 @@ pub async fn reconcile_orphaned_positions(
                 is_neg_risk: false, // ArbitrageStrategy only runs on standard binary markets
                 paired_token_id: position.paired_leg_token_id,
                 original_entry: position.avg_entry,
+                ghost: position.ghost,
+                strategy: strategy_name.clone(),
             });
         }
     }
@@ -494,6 +585,8 @@ pub async fn reconcile_orphaned_positions(
                 is_neg_risk: false,
                 paired_token_id: None, // force flatten-only (no re-hedge atop existing opposite leg)
                 original_entry: position.avg_entry,
+                ghost: position.ghost,
+                strategy: strategy_name.clone(),
             });
         }
     }

@@ -41,16 +41,36 @@ const RAPTOR_META: Record<
   },
 };
 
+/** Per-raptor source labels when MARKET_DATA_SOURCE=hyperliquid. The Tide Raptor
+ *  is source-independent (Alpaca/iNAV) so it keeps its RAPTOR_META source. */
+const HYPERLIQUID_SOURCE: Record<string, string> = {
+  price:       'Hyperliquid Trades WS',
+  funding:     'Hyperliquid Funding (assetCtx)',
+  derivatives: 'Hyperliquid OI + CVD',
+};
+
+/** Resolve the human-readable source label for a raptor kind, parameterized by
+ *  the active market-data source. Falls back to the Binance RAPTOR_META label
+ *  when the source is absent (older backend) or not hyperliquid. */
+function raptorSource(kind: string, marketDataSource?: string): string | undefined {
+  if (marketDataSource === 'hyperliquid' && HYPERLIQUID_SOURCE[kind]) {
+    return HYPERLIQUID_SOURCE[kind];
+  }
+  return RAPTOR_META[kind]?.source;
+}
+
 function RaptorHealthPanel({
   raptorKinds,
   raptors,
   asset,
   marketClass,
+  marketDataSource,
 }: {
   raptorKinds: string[];
   raptors?: Record<string, AssetRaptorHealth>;
   asset: string;
   marketClass: string;
+  marketDataSource?: string;
 }) {
   const h = raptors?.[asset];
 
@@ -103,7 +123,7 @@ function RaptorHealthPanel({
             );
           })}
           {(() => {
-            const sources = raptorKinds.map((k) => RAPTOR_META[k]?.source).filter(Boolean);
+            const sources = raptorKinds.map((k) => raptorSource(k, marketDataSource)).filter(Boolean);
             return sources.length > 0 ? (
               <div className="text-[10px] font-mono text-gray-600 pt-1">
                 Source: {sources.join(' + ')}
@@ -257,6 +277,7 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
           raptors={status?.raptors}
           asset={asset}
           marketClass={marketClass}
+          marketDataSource={status?.market_data_source}
         />
       </div>
 

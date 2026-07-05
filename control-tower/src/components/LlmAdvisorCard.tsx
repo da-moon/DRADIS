@@ -7,6 +7,10 @@ interface Props {
   recommendations: LlmRecommendationRow[];
   isLoading: boolean;
   advisorEnabled: boolean;
+  /** Effective advisor provider (GET /api/status.llm_provider). */
+  llmProvider?: string;
+  /** Effective advisor model tag (GET /api/status.llm_model). */
+  llmModel?: string;
 }
 
 /** Format an ISO timestamp to a short local string, e.g. "May 11, 14:32" */
@@ -22,7 +26,7 @@ function fmtTs(iso: string): string {
   }
 }
 
-export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnabled }: Props) {
+export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnabled, llmProvider, llmModel }: Props) {
   const [idx, setIdx] = useState(0);
   const [dismissed, setDismissed] = useState<Set<number>>(new Set());
   const [expanded, setExpanded] = useState(false);
@@ -52,6 +56,14 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
         <div className="flex items-center gap-2">
           <p className="label-muted">LLM Advisor</p>
           <span className="text-xs font-mono text-gray-600">🤖</span>
+          {llmProvider && (
+            <span
+              className="text-[10px] font-mono bg-violet-500/10 text-violet-300 border border-violet-500/20 rounded px-1.5 py-0.5"
+              title="Effective LLM Advisor provider/model (resolved server-side; no key)"
+            >
+              {llmProvider}{llmModel ? ` · ${llmModel}` : ''}
+            </span>
+          )}
           {!advisorEnabled && (
             <span className="text-[10px] font-mono bg-gray-800 text-gray-500 border border-gray-700 rounded px-1.5 py-0.5">
               DISABLED

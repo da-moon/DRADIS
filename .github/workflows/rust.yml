@@ -40,5 +40,20 @@ jobs:
     - name: Check
       run: cargo check --verbose
 
+    # Prove the additive `hyperliquid` feature is cleanly strippable: the engine
+    # must still compile (and fall back to Binance) with it disabled.
+    - name: Check (no hyperliquid feature)
+      run: cargo check --no-default-features --features intl_clob --verbose
+
     - name: Run tests
       run: cargo test --verbose
+
+    # Backtesting subsystem (non-default `backtest` feature). rs-backtester drags an
+    # unconditional plotting/font stack that needs system libfontconfig1-dev +
+    # pkg-config to build, so this is a SEPARATE step — default builds above never
+    # pay that cost. hyperliquid-backtest is deliberately NOT a dependency.
+    - name: Install backtest system deps
+      run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev pkg-config
+
+    - name: Check (backtest feature)
+      run: cargo check --features backtest --verbose

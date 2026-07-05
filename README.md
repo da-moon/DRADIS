@@ -135,7 +135,7 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         src/ layout                                 │
 │                                                                     │
-│  raptors/          ← Signal scouts (Binance WS + FAPI REST)         │
+│  raptors/          ← Signal scouts (Binance or Hyperliquid)         │
 │  vipers/           ← Trading strategies (8 Vipers)                  │
 │  squadron/         ← Deployment layer (Raptor+Viper+Market bundle)  │
 │  cag/              ← Commander (async dispatch, multi-asset)        │
@@ -150,11 +150,11 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 ┌──────────────────────┐   ┌──────────────────────┐
 │    src/raptors/      │   │  Polymarket CLOB     │
 │  Price Raptor        │   │  (WebSocket Feed)    │
-│  (Binance Spot WS)   │   │                      │
+│  (Binance/Hyperliq)  │   │                      │
 │  Funding Raptor      │   │                      │
-│  (Binance FAPI REST) │   │                      │
+│  (Binance/Hyperliq)  │   │                      │
 │  Derivatives Raptor  │   │                      │
-│  (Binance FAPI: OI)  │   │                      │
+│  (Binance/Hyperliq)  │   │                      │
 │  Tide Raptor         │   │                      │
 │  (Alpaca IEX + iNAV) │   │                      │
 └──────────┬───────────┘   └───────────┬──────────┘
@@ -233,14 +233,22 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 
 | Raptor                         | Source                  | Signal                                                  | Module                   |
 |--------------------------------|-------------------------|---------------------------------------------------------|--------------------------|
-| **Price Raptor**               | Binance Spot WS         | spot price, 5s/1s velocity, acceleration, 10m/60m drift | `src/raptors/price.rs`   |
-| **Funding Raptor**             | Binance Perpetuals FAPI | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
-| **Derivatives Raptor**         | Binance Perpetuals FAPI | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
+| **Price Raptor**               | Binance or Hyperliquid (`MARKET_DATA_SOURCE`) | spot price, 5s/1s velocity, acceleration, 10m/60m drift | `src/raptors/price.rs`   |
+| **Funding Raptor**             | Binance or Hyperliquid (`MARKET_DATA_SOURCE`) | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
+| **Derivatives Raptor**         | Binance or Hyperliquid (`MARKET_DATA_SOURCE`) | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
 | **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
 | *(future)* **Sports Raptor**   | Line movement APIs      | Betting line drift, public money %                      | —                        |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
 When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence); Basis, Momentum and TrendCapture use them as confirmation gates; and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
+
+### Market data source: Binance or Hyperliquid
+
+The Price / Funding / Derivatives Raptors read from a runtime-selectable **market-data source**. The default is Binance; set `MARKET_DATA_SOURCE=hyperliquid` (env var, or `MARKET_DATA_SOURCE` in `src/config.rs`) to feed the raptor layer from the [Hyperliquid](https://hyperliquid.xyz) public Info API instead. This is a **data source only** — no keys, no signing, no trading; execution stays on Polymarket.
+
+- **Enable:** `MARKET_DATA_SOURCE=hyperliquid` on the default build (the `hyperliquid` cargo feature ships in `default`). On a build compiled without that feature the engine logs an error and falls back to Binance — it never panics.
+- **What maps to what:** one WS raptor per asset replaces the Binance trio. `Trades{coin}` → oracle price + 5s/1s velocity + acceleration + 10m/60m drift + rolling taker **CVD**; `ActiveAssetCtx{coin}` → funding rate (Hyperliquid quotes an **hourly** rate, so DRADIS emits it **×8** to match Binance's per-8h `lastFundingRate` semantics that the viper thresholds are tuned on) + **open interest** (sampled on the same 30s cadence as the Binance OI delta).
+- **Resolution-source caveat (read this):** Polymarket's crypto "Up or Down" markets typically **resolve on Binance prices**. Running `MARKET_DATA_SOURCE=hyperliquid` means the oracle and strike-price references DRADIS trades against may deviate slightly from the market's actual resolution source. This is an intentional operator trade-off — useful e.g. in regions where Binance is unreachable — not a free swap. Prefer Binance unless you have a specific reason.
 
 ---
 
@@ -348,9 +356,9 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 
 ### Live Config Editing
 
-Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. Changes take effect on the next 50ms tick.
+Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. The edit is fanned out to every squadron's config row and reaches running squadrons within ~30 seconds (each squadron reloads its config on a periodic timer).
 
-> **Hot-Enable Design** — All eight Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
+> **Hot-Enable Design** — All eight Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session; the change takes effect on running squadrons within ~30 seconds.
 
 ### Authentication
 
@@ -364,22 +372,140 @@ CT_PASSWORD=your-strong-password
 
 ## LLM Advisor
 
-Optional background task. Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 min) it fetches recent trades from SQLite, analyzes them with a local Ollama model, and posts plain-English optimization recommendations to Telegram.
+Optional background task. Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 min) it fetches recent trades from SQLite, analyzes them with an LLM, and posts plain-English optimization recommendations to Telegram + the Control Tower.
+
+The backend is **provider-neutral** and selected at **runtime** (no rebuild). All provider wiring lives behind a small DRADIS-owned trait in `src/helpers/llm_client.rs` (built on [`rig-core`](https://crates.io/crates/rig-core)); the advisor loop only ever sees a `Box<dyn LlmChat>`. The default is Ollama, so existing deployments that only set `OLLAMA_URL`/`OLLAMA_MODEL` keep working **unchanged** (same endpoints, `num_ctx=3072`/`num_predict=900`/`temperature=0.3`, same timeouts and probe).
+
+### Provider matrix
+
+| `LLM_PROVIDER` | Backend | Auth | Base URL |
+|---|---|---|---|
+| `ollama` (default) | Local/remote Ollama (`/api/chat`) | none | `LLM_BASE_URL` → `OLLAMA_URL` → default `http://localhost:11434` |
+| `anthropic` | Claude models | `ANTHROPIC_API_KEY` | optional override via `LLM_BASE_URL` |
+| `openai` | OpenAI platform (Chat Completions) | `OPENAI_API_KEY` | optional override via `LLM_BASE_URL` |
+| `openai-compatible` | vLLM / LM Studio / OpenRouter / Groq … | `OPENAI_API_KEY` (optional) | **required** `LLM_BASE_URL` |
+| `chatgpt` | "Sign in with ChatGPT" OAuth | subscription token / OAuth file | — |
+
+### Configuration
 
 ```rust
-// src/config.rs
+// src/config.rs — compile-time defaults
 pub const ENABLE_LLM_ADVISOR: bool = true;
 pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 1800;
-pub const LLM_ADVISOR_TRADES_LOOKBACK: i64 = 20;
+pub const LLM_PROVIDER: &str = "ollama";      // ollama|anthropic|openai|openai-compatible|chatgpt
+pub const LLM_MODEL: &str = "";               // "" = ollama uses LLM_OLLAMA_MODEL; cloud requires a value
+pub const LLM_BASE_URL: &str = "";            // "" = provider default (ollama falls back to LLM_OLLAMA_URL)
+pub const LLM_CLOUD_TIMEOUT_SECS: u64 = 120;  // cloud inference timeout (ollama keeps LLM_INFERENCE_TIMEOUT_SECS=480)
 pub const LLM_OLLAMA_URL: &str = "http://localhost:11434";
 pub const LLM_OLLAMA_MODEL: &str = "llama3.2";
 ```
 
+Everything is overridable at runtime via env (`.env`), no rebuild required. See `.env.example` for the full list.
+
+### Per-provider setup
+
+**Ollama (default — unchanged):**
 ```bash
-# Override at runtime without rebuilding
-OLLAMA_URL=http://192.168.1.10:11434
+# ollama pull llama3.2
+OLLAMA_URL=http://192.168.1.10:11434   # legacy vars still honoured
 OLLAMA_MODEL=mistral
 ```
+
+**Anthropic (Claude):**
+```bash
+LLM_PROVIDER=anthropic
+LLM_MODEL=claude-3-5-sonnet-latest
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**OpenAI:**
+```bash
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o-mini
+OPENAI_API_KEY=sk-...
+```
+
+**OpenAI-compatible (LM Studio / OpenRouter / vLLM / Groq):** `LLM_BASE_URL` is required — include the `/v1` suffix if your server needs it. Local servers are usually keyless (a dummy key is sent automatically); hosted gateways like OpenRouter need `OPENAI_API_KEY`.
+```bash
+# LM Studio (keyless, local)
+LLM_PROVIDER=openai-compatible
+LLM_BASE_URL=http://localhost:1234/v1
+LLM_MODEL=qwen2.5-7b-instruct
+
+# OpenRouter (hosted)
+LLM_PROVIDER=openai-compatible
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=meta-llama/llama-3.1-8b-instruct
+OPENAI_API_KEY=sk-or-...
+```
+
+**ChatGPT (OAuth subscription):** authenticates against the "Sign in with ChatGPT" backend. **This bills to a ChatGPT subscription, not to OpenAI API credits.** Simplest for a headless server is an explicit access token; otherwise place a rig-format `auth.json` (auto-refreshing) at `~/.config/chatgpt/auth.json` or point `CHATGPT_AUTH_FILE` at your own file. A missing/expired token with no refresh triggers an interactive device-code login (not suitable for headless).
+```bash
+LLM_PROVIDER=chatgpt
+LLM_MODEL=gpt-5.3-codex
+CHATGPT_ACCESS_TOKEN=<oauth-access-token>   # or leave unset to use the OAuth auth.json
+# CHATGPT_ACCOUNT_ID=<optional>
+# CHATGPT_AUTH_FILE=/path/to/auth.json
+```
+
+The stored recommendation is tagged `provider/model` (e.g. `anthropic/claude-3-5-sonnet-latest`) and rendered as the Control Tower badge.
+
+---
+
+## Backtesting (`backtest` feature)
+
+An offline harness that replays historical **Hyperliquid** 1-minute candles + funding
+through the **real viper strategies** (the same `Strategy` objects the live bot runs),
+behind the clock seam so warmup / staleness / cooldown / hold-time gates evaluate
+against *historical* time at any replay speed. It is behind a **non-default** cargo
+feature so normal builds/CI never pay its cost.
+
+```bash
+# System deps (rs-backtester drags a plotting/font stack):
+sudo apt-get install -y libfontconfig1-dev pkg-config
+
+# Replay the last ~5h of BTC through every viper:
+cargo run --features backtest --bin backtest -- \
+  --coin BTC --start now-6h --end now-1h
+
+# Sweep a subset with a custom book model:
+cargo run --features backtest --bin backtest -- \
+  --coin BTC --start 2026-07-01T00:00:00Z --end 2026-07-01T06:00:00Z \
+  --strategies momentum,trendreversal --spread 0.02 --depth 500 --commission 0.0 \
+  --out backtest_out --cache backtest_cache.sqlite
+```
+
+Each run prints a per-strategy table (trades / win-rate / native PnL), the
+rs-backtester Sharpe/drawdown/win-rate, and a **fidelity-tier disclaimer**, and writes
+`report.json` + `trades.csv` + `equity.csv` into `--out`.
+
+**Two PnL views, deliberately:**
+1. **Native Decimal ledger** (authoritative) — prices the actual binary YES/NO shares
+   and settles 0/1 at expiry vs strike.
+2. **rs-backtester metrics** (directional proxy) — `BUY/SHORTSELL/NULL` on the
+   underlying candle series; a linear-instrument proxy, **not** the binary payoff.
+
+**Honest fidelity tiers** (printed with every result):
+- **Tier A** — `drift_10m`/`drift_60m` gates and strike-distance gates are faithful.
+- **Tier B** — velocity gates: `velocity_5s`/`velocity_1s` come from 1m closes at 60s
+  steps, so sub-5s windows are ~0 (velocity-gated logic is approximate). Funding is a
+  real historical series (HL hourly rate **×8**-normalized onto Binance's per-8h scale;
+  funding is a **signal only** — binary shares pay no carry).
+- **Tier C** — the 8 Polymarket book fields are a parametric binary-option model
+  (`--spread`/`--depth`), **not** a real order book; OI/CVD and
+  `institutional_pulse`/`tide_coherence` have no historical source (= 0), so
+  **Convergence is excluded** (always no-ops) and **TrendReversal's SQLite cascade
+  guard no-ops**.
+
+The `--cache` SQLite file is separate from the live trading DB and fills gaps only
+(re-runs are free). `--llm-score` (experimental, off by default) asks the configured
+LLM provider for a 0–100 conviction score per entry and joins it against realized PnL
+in `report.json`; it degrades gracefully if no provider is configured, and API keys
+are never logged. `hyperliquid-backtest` is deliberately **not** a dependency — its
+advertised fetch/backtest/report API is unreachable dead code in the published crate.
+
+> ⚠️ On Linux, never call rs-backtester's `plot()`/`i_chart()` — they hard-code a
+> Windows path join. The harness only reads `Backtest.metrics` + `report_horizontal`.
 
 ---
 
@@ -626,11 +752,50 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 
 **Why doesn't DRADIS include a backtesting framework?**
 
-| Concern              | Backtester                                                | Ghost Mode                                 |
-|----------------------|-----------------------------------------------------------|--------------------------------------------|
-| Market data fidelity | Requires storing full L2 orderbook snapshots              | Real-time Polymarket CLOB — 100% authentic |
-| Strategy fidelity    | Must mock async execution, cooldown maps, drawdown guards | Full production code path runs unchanged   |
-| Fill simulation      | Assumes fills that may never occur in thin markets        | No fills in ghost — no wishful thinking    |
-| Build/maintain cost  | Significant                                               | Zero — `GHOST_MODE = true` in `config.rs`  |
+| Concern              | Backtester                                                | Ghost (Paper) Mode                          |
+|----------------------|-----------------------------------------------------------|---------------------------------------------|
+| Market data fidelity | Requires storing full L2 orderbook snapshots              | Real-time Polymarket CLOB — 100% authentic  |
+| Strategy fidelity    | Must mock async execution, cooldown maps, drawdown guards | Full production code path runs unchanged    |
+| Fill simulation      | Assumes fills that may never occur in thin markets        | Depth-aware simulated fills (see below)     |
+| Build/maintain cost  | Significant                                               | Zero — flip the runtime GHOST/LIVE toggle   |
 
 Workflow: ghost overnight → `tools/session_parser.py` → tune `config.rs` → repeat until positive expectancy.
+
+**Paper trading (Ghost Mode)**
+
+The Control Tower GHOST/LIVE toggle is a real runtime switch, not just a badge. In the
+default `intl_clob` build it controls order placement live via the hot-patchable
+`DynamicConfig` — no rebuild required. The compiled `config::GHOST_MODE` constant now
+only *seeds* the initial toggle state (and is recorded in the startup config-history
+snapshot); it no longer gates trading.
+
+- **Position-scoped, grandfathered.** Each position permanently carries the mode it was
+  opened under. Flipping the toggle affects only NEW orders (within ~30 seconds on a
+  running squadron): open positions keep the mode they were opened with. Exits, orphan
+  sweeps, and expiry settlement all key off the position's own mode, never the current toggle.
+- **Depth-aware simulated fills.** Ghost entries fill up to the visible ask depth at the
+  requested price (± the usual offsets); any overflow fills one tranche worse by
+  `PAPER_OVERFLOW_SLIPPAGE` (default 2¢), weighted-averaged into `avg_entry`. Ghost exits
+  are symmetric against the bid. No more instant, full, frictionless fills.
+- **Resting maker quotes.** Ghost `MakerQuote`s no longer instafill. They rest in a
+  simulated queue and fill only after the market's best bid has sat at/below the quote
+  for `PAPER_MAKER_FILL_TICKS` (default 3) consecutive patrol ticks.
+- **Paper ledger.** A simulated collateral ledger is seeded from
+  `PAPER_STARTING_COLLATERAL` (default $1000). Ghost entries debit their cost and are
+  rejected (warn + skip) when the ledger is insufficient; ghost exits and settlements
+  credit their proceeds. Paper P&L and paper balance are tracked **separately** from live
+  money and surfaced on `GET /api/status` (`paper_pnl`, `paper_balance`) and in the
+  Control Tower's "Paper Ledger" card. As a result, `total_pnl` (the headline session
+  P&L) is now **live-only** — ghost activity no longer commingles into it.
+- **Binary expiry settlement.** Ghost positions that reach expiry without an explicit
+  exit now settle at their binary payout ($1 if the market resolved in the token's
+  favour vs. the strike, else $0) instead of silently vanishing — booking realized paper
+  P&L and recording a `expiry_settlement_sim` trade.
+- **Full DB parity.** Ghost exits and maker fills write the same rows live ones do
+  (`trades` + `open_positions`), and both the `trades` and `entries` tables now carry a
+  `ghost_mode` column, so paper and live history are cleanly separable across sessions.
+  The Control Tower badges ghost trades/positions with 👻 and labels ghost
+  notifications `👻 [PAPER]`.
+
+Not in scope (deliberately): credential-free boot — the default build still requires
+`POLYGON_RPC_URL` + a Polymarket-accepted key + live CLOB auth even in ghost mode.

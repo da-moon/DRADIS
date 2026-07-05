@@ -12,6 +12,7 @@ use crate::state::MarketSnapshot;
 /// Records a completed trade to the SQLite database.
 ///
 /// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives the SQLite pool selection.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_trade(
     asset: &str,
     strategy: String,
@@ -22,12 +23,14 @@ pub async fn record_trade(
     shares: Decimal,
     profit_usdc: Decimal,
     reason: String,
+    ghost: bool,
 ) {
-    record_trade_with_timestamp(asset, strategy, market, side, entry_price, exit_price, shares, profit_usdc, reason, None).await;
+    record_trade_with_timestamp(asset, strategy, market, side, entry_price, exit_price, shares, profit_usdc, reason, None, ghost).await;
 }
 
 /// Record a trade with an explicit timestamp (for retrospective settlements).
 /// If `timestamp` is None, uses current time.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_trade_with_timestamp(
     asset: &str,
     strategy: String,
@@ -39,9 +42,10 @@ pub async fn record_trade_with_timestamp(
     profit_usdc: Decimal,
     reason: String,
     timestamp: Option<DateTime<Utc>>,
+    ghost: bool,
 ) {
     if let Some(pool) = db::pool_for(asset) {
-        db::record_trade_db(&pool, &strategy, &market, &side, entry_price, exit_price, shares, profit_usdc, &reason, timestamp).await;
+        db::record_trade_db(&pool, &strategy, &market, &side, entry_price, exit_price, shares, profit_usdc, &reason, timestamp, ghost).await;
         info!("📊 Trade recorded to database: {} {} {}", strategy, market, side);
     }
 }
@@ -50,6 +54,7 @@ pub async fn record_trade_with_timestamp(
 ///
 /// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives SQLite pool selection.
 /// `token_id` — stored as decimal string representation (same as U256::to_string()).
+#[allow(clippy::too_many_arguments)]
 pub async fn record_entry(
     asset: &str,
     strategy: String,
@@ -58,9 +63,10 @@ pub async fn record_entry(
     side: String,
     entry_price: Decimal,
     shares: Decimal,
+    ghost: bool,
 ) {
     if let Some(pool) = db::pool_for(asset) {
-        db::record_entry_db(&pool, &strategy, &token_id, &market, &side, entry_price, shares).await;
+        db::record_entry_db(&pool, &strategy, &token_id, &market, &side, entry_price, shares, ghost).await;
     }
 }
 

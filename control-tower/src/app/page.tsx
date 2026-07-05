@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
 import dynamic from 'next/dynamic';
 
@@ -11,13 +11,14 @@ import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import ErrorBoundary   from '@/components/ErrorBoundary';
-import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
+import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons, probeBacktest } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
-import type { DynamicConfig, SquadronSummary } from '@/lib/types';
+import type { DynamicConfig, SquadronSummary, TradeRow } from '@/lib/types';
 
 // Recharts must be loaded client-side only
 const PnlChart = dynamic(() => import('@/components/PnlChart'), { ssr: false });
 const TelemetryPage = dynamic(() => import('@/components/TelemetryPage'), { ssr: false });
+const BacktestPage = dynamic(() => import('@/components/BacktestPage'), { ssr: false });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -106,10 +107,98 @@ function StatCard({ label, value, sub, valueClass = '' }: {
 function GhostBanner({ ghost }: { ghost: boolean }) {
   return ghost ? (
     <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg px-4 py-2 text-amber-300 text-xs font-mono flex items-center gap-2">
-      <span className="text-base"></span>
-      <span><strong>GHOST MODE ACTIVE</strong> — orders are simulated, no real CLOB calls.</span>
+      <span className="text-base">👻</span>
+      <span>
+        <strong>GHOST MODE ACTIVE</strong> — new orders are simulated (paper), no real CLOB calls.
+        Toggling affects NEW orders within ~30 seconds; open positions keep the mode they were opened with.
+      </span>
     </div>
   ) : null;
+}
+
+// ── Paper equity sparkline ────────────────────────────────────────────────────
+
+/** Tiny inline-SVG sparkline of the cumulative paper-equity series. No deps. */
+function PaperSparkline({ series, width = 132, height = 34 }: {
+  series: number[]; width?: number; height?: number;
+}) {
+  if (series.length < 2) return null;
+  const min = Math.min(...series);
+  const max = Math.max(...series);
+  const span = max - min || 1;
+  const pad = 2;
+  const stepX = (width - pad * 2) / (series.length - 1);
+  const y = (v: number) => pad + (height - pad * 2) * (1 - (v - min) / span);
+  const pts = series.map((v, i) => `${(pad + i * stepX).toFixed(2)},${y(v).toFixed(2)}`).join(' ');
+  const up = series[series.length - 1] >= series[0];
+  const stroke = up ? '#4ade80' : '#f87171';
+  const baseY = y(series[0]);
+  return (
+    <svg width={width} height={height} className="overflow-visible" aria-hidden="true">
+      <line x1={pad} y1={baseY} x2={width - pad} y2={baseY} stroke="#334155" strokeWidth={1} strokeDasharray="3 3" />
+      <polyline points={pts} fill="none" stroke={stroke} strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// ── Paper (ghost) ledger card ─────────────────────────────────────────────────
+
+function PaperLedgerCard({
+  paperPnl, paperBalance, paperTrades,
+}: {
+  paperPnl: number; paperBalance: number;
+  /** Ghost trades (ascending by ts) with realized pnl, from the already-fetched trades. */
+  paperTrades: { ts: number; pnl: number }[];
+}) {
+  const positive = paperPnl >= 0;
+
+  // Cumulative paper-equity series, ANCHORED so its endpoint equals the current Paper
+  // Balance headline. We can't anchor at a fixed all-time starting balance and sum
+  // forward: the fetched ghost trades are only the newest ~60 per asset (and may span
+  // prior sessions), whereas paperBalance/paperPnl are the current in-memory ledger, so a
+  // forward-summed curve's endpoint would silently disagree with the headline once trades
+  // are truncated or a session rolls over. Instead we walk BACKWARD from paperBalance:
+  // last point = balance, each earlier point subtracts the following trade's pnl. The
+  // endpoint is always consistent with the headline; the curve shows the shape of the
+  // fetched window. Purely client-side from the already-fetched trades — no backend.
+  const series = useMemo(() => {
+    const total = paperTrades.reduce((sum, t) => sum + t.pnl, 0);
+    let acc = paperBalance - total;
+    const pts = [acc];
+    for (const t of paperTrades) {
+      acc += t.pnl;
+      pts.push(acc);
+    }
+    return pts;
+  }, [paperBalance, paperTrades]);
+
+  return (
+    <div className="card px-5 py-3 flex flex-wrap items-center gap-x-8 gap-y-2 border border-amber-500/20 bg-[#0d0d1a]">
+      <div className="flex items-center gap-2">
+        <span className="text-base">👻</span>
+        <span className="label-muted text-xs">Paper Ledger</span>
+        <span className="text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded px-1.5 py-0.5">
+          simulated
+        </span>
+      </div>
+      <div className="flex flex-col gap-0.5">
+        <span className="text-gray-500 text-xs font-mono">Paper P&amp;L</span>
+        <span className={`text-sm font-mono ${positive ? 'text-green-400' : 'text-red-400'}`}>
+          {(positive ? '+' : '') + fmt$(paperPnl)}
+        </span>
+      </div>
+      <div className="flex flex-col gap-0.5">
+        <span className="text-gray-500 text-xs font-mono">Paper Balance</span>
+        <span className="text-sm font-mono text-gray-300">{fmt$(paperBalance)}</span>
+      </div>
+      {series.length >= 2 && (
+        <div className="flex flex-col gap-0.5 ml-auto">
+          <span className="text-gray-500 text-[10px] font-mono">Paper Equity ({series.length - 1} trades)</span>
+          <PaperSparkline series={series} />
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Asset selector tabs ───────────────────────────────────────────────────────
@@ -227,19 +316,23 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'telemetry' | 'tradelog';
+type AppView = 'main' | 'telemetry' | 'tradelog' | 'backtest';
 
 function NavTabs({
   active,
   onChange,
+  showBacktest,
 }: {
   active: AppView;
   onChange: (v: AppView) => void;
+  showBacktest: boolean;
 }) {
   const tabs: { id: AppView; label: string; icon: string }[] = [
     { id: 'main',      label: 'Main',      icon: '🗺️' },
     { id: 'telemetry', label: 'Telemetry', icon: '📡' },
     { id: 'tradelog',  label: 'Tradelog',  icon: '📋' },
+    // Backtest tab only when the feature-gated backend endpoint is present.
+    ...(showBacktest ? [{ id: 'backtest' as AppView, label: 'Backtest', icon: '🧪' }] : []),
   ];
   return (
     <div className="flex items-center gap-1">
@@ -332,6 +425,17 @@ export default function DashboardPage() {
   const { data: squadrons, isLoading: squadronsLoading } =
     useSWR('squadrons', getSquadrons, { refreshInterval: 10_000 });
 
+  // Probe once whether the feature-gated backtest API is present. Default builds
+  // omit those routes (404) → the Backtest tab stays hidden.
+  const { data: backtestAvailable = false } =
+    useSWR('backtest-available', probeBacktest, { refreshInterval: 0, revalidateOnFocus: false });
+
+  // If the tab is hidden but somehow active (e.g. backend restarted without the
+  // feature), fall back to Main so we never render a dead view.
+  useEffect(() => {
+    if (activeView === 'backtest' && !backtestAvailable) setActiveView('main');
+  }, [activeView, backtestAvailable]);
+
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
   const oldestSnap  = pnl?.[pnl.length - 1];
@@ -377,7 +481,7 @@ export default function DashboardPage() {
                 <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
                 <span className="text-gray-600 text-lg">|</span>
               </div>
-              <NavTabs active={activeView} onChange={(v) => { setActiveView(v); setFocusedSquadronId(null); }} />
+              <NavTabs active={activeView} onChange={(v) => { setActiveView(v); setFocusedSquadronId(null); }} showBacktest={backtestAvailable} />
             </div>
 
             {/* Center — BSG motto */}
@@ -397,6 +501,7 @@ export default function DashboardPage() {
               {config && !DEMO_MODE && (
                 <button
                   onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
+                  title="Affects NEW orders within ~30 seconds. Open positions keep the mode they were opened with (grandfathered); ghost positions stay simulated."
                   className={[
                     'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
                     config.ghost_mode
@@ -437,7 +542,7 @@ export default function DashboardPage() {
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
               <span className="text-gray-600 text-lg">|</span>
             </div>
-            <NavTabs active={activeView} onChange={setActiveView} />
+            <NavTabs active={activeView} onChange={setActiveView} showBacktest={backtestAvailable} />
           </div>
 
           {/* Center — BSG motto */}
@@ -457,6 +562,7 @@ export default function DashboardPage() {
             {config && !DEMO_MODE && (
               <button
                 onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
+                title="Affects NEW orders within ~30 seconds. Open positions keep the mode they were opened with (grandfathered); ghost positions stay simulated."
                 className={[
                   'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
                   config.ghost_mode
@@ -498,6 +604,20 @@ export default function DashboardPage() {
         </main>
       )}
 
+      {/* ── Backtest view (feature-gated backend) ──────────────────────────── */}
+      {activeView === 'backtest' && backtestAvailable && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {config?.ghost_mode && <GhostBanner ghost />}
+          <ErrorBoundary label="Backtest">
+            <BacktestPage availableAssets={availableAssets} />
+          </ErrorBoundary>
+          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
+            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
+            <span className="text-gray-600">So say we all.</span>
+          </footer>
+        </main>
+      )}
+
       {/* ── Main view ──────────────────────────────────────────────────────── */}
       {activeView === 'main' && (
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
@@ -517,6 +637,24 @@ export default function DashboardPage() {
           pricesLive={portfolio?.prices_live ?? true}
           isLoading={portfolioLoading}
         />
+
+        {/* ── Paper (ghost) ledger — shown when ghosting or any paper activity ── */}
+        {(() => {
+          const paperPnl = parseFloat(status?.paper_pnl ?? '0');
+          const paperBalance = parseFloat(status?.paper_balance ?? '0');
+          // Show when ghosting or once any paper activity has realized P&L. NOTE: do not
+          // test `paperBalance !== 0` — the ledger is seeded to PAPER_STARTING_COLLATERAL
+          // (1000) per squadron session, so it is always non-zero even for a pure-live
+          // operator; that made the card render permanently.
+          const show = (config?.ghost_mode ?? false) || paperPnl !== 0;
+          // Ghost trades across all assets, ascending by ts, for the equity sparkline.
+          const paperTrades = ((allTrades ?? []) as TradeRow[])
+            .filter(t => t.ghost_mode)
+            .map(t => ({ ts: new Date(t.ts).getTime(), pnl: parseFloat(t.pnl) }))
+            .filter(t => Number.isFinite(t.ts) && Number.isFinite(t.pnl))
+            .sort((a, b) => a.ts - b.ts);
+          return show ? <PaperLedgerCard paperPnl={paperPnl} paperBalance={paperBalance} paperTrades={paperTrades} /> : null;
+        })()}
 
         {/* ── Portfolio History Chart (CAG-level) ───────────────────────── */}
         {pnlLoading ? (
@@ -564,6 +702,8 @@ export default function DashboardPage() {
           recommendations={llmRecs ?? []}
           isLoading={llmLoading}
           advisorEnabled={true}
+          llmProvider={status?.llm_provider}
+          llmModel={status?.llm_model}
         />
 
         {/* ── CAG Squadron Registry ─────────────────────────────────────── */}

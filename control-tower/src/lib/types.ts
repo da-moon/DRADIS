@@ -107,6 +107,7 @@ export interface TradeRow {
   shares:      string;
   pnl:         string;
   reason:      string;
+  ghost_mode:  boolean; // true when this trade closed a simulated (paper) position
 }
 
 /** A position that has been entered but not yet exited (all strategies, ghost+live). */
@@ -200,8 +201,22 @@ export interface StatusResponse {
   strategy_markets: Record<string, string>;
   /** RFC-3339 timestamp of the current bot session start (= process startup). */
   session_started_at?: string;
-  /** Per-asset Binance Raptor connection health. Key = asset symbol (e.g. "btc"). */
+  /** Per-asset Raptor connection health. Key = asset symbol (e.g. "btc"). */
   raptors?: Record<string, AssetRaptorHealth>;
+  /** Active market-data source ("binance" | "hyperliquid"). Absent on older
+   *  backends → treat as "binance". Drives the Raptor/telemetry source labels. */
+  market_data_source?: string;
+  /** Realized paper (ghost) session P&L across all squadrons (Decimal string).
+   *  Segregated from the live session P&L. Absent on older backends. */
+  paper_pnl?: string;
+  /** Simulated paper collateral balance across all squadrons (Decimal string). */
+  paper_balance?: string;
+  /** Effective LLM Advisor provider ("ollama" | "anthropic" | "openai" |
+   *  "openai-compatible" | "chatgpt"). Absent on older backends. Never a key. */
+  llm_provider?: string;
+  /** Effective LLM Advisor model tag (e.g. "llama3.2"). Empty when a cloud
+   *  provider is selected but no model is configured. Absent on older backends. */
+  llm_model?: string;
 }
 
 /** Portfolio value response from /api/portfolio — cash + open positions at live prices. */
@@ -212,6 +227,137 @@ export interface PortfolioValue {
   unrealized_pnl:  string; // Σ(shares × (current_mid − entry_price))
   position_count:  number;
   prices_live:     boolean; // false when Polymarket CLOB was unreachable
+}
+
+// ── Backtest types (feature-gated backend; `--features backtest`) ─────────────
+//
+// Mirrors src/api/backtest_api.rs + the report.json structure from
+// src/backtest/report.rs::build_report_json. Every Decimal arrives as a string.
+
+export type BacktestRunStatus = 'running' | 'done' | 'failed';
+
+/** Echo of the resolved run parameters (string-encoded Decimals). */
+export interface BacktestRunParams {
+  coin:        string;
+  interval:    string;
+  start_ms:    number;
+  end_ms:      number;
+  spread:      string;
+  depth:       string;
+  commission:  string;
+  starting:    string;
+  strategies:  string[] | null;
+  llm_score:   boolean;
+}
+
+/** Lightweight list entry — GET /api/backtest/runs. */
+export interface BacktestRunSummary {
+  id:          string;
+  params:      BacktestRunParams;
+  status:      BacktestRunStatus;
+  error:       string | null;
+  started_at:  string;
+  finished_at: string | null;
+}
+
+/** One equity-curve sample. */
+export interface BacktestEquityPoint {
+  ts:     string; // RFC-3339
+  equity: string; // Decimal string
+}
+
+/** One closed trade row. */
+export interface BacktestTrade {
+  strategy:    string;
+  side:        string;
+  kind:        string; // "Exit" | "Settlement"
+  entry_ts:    string;
+  exit_ts:     string;
+  entry_price: string;
+  exit_price:  string;
+  shares:      string;
+  pnl:         string;
+  reason:      string;
+}
+
+/** Per-strategy native-ledger roll-up (report.native_ledger.per_strategy[]). */
+export interface BacktestStrategyStat {
+  strategy:     string;
+  trades:       number;
+  wins:         number;
+  win_rate_pct: number;
+  pnl:          string; // Decimal string
+}
+
+/** rs-backtester directional-proxy metrics (report.rs_backtester; null if skipped). */
+export interface BacktestRsMetrics {
+  note:             string;
+  return_pct:       number | null;
+  sharpe:           number | null;
+  max_drawdown_pct: number | null;
+  win_rate_pct:     number | null;
+  trades_nr:        number | null;
+}
+
+/** One LLM decision score (report.llm_scores[]). */
+export interface BacktestLlmScore {
+  strategy:     string;
+  side:         string;
+  entry_ts:     string;
+  score:        number;
+  rationale:    string;
+  realized_pnl: string | null;
+}
+
+/** The report.json document (report.rs::build_report_json). */
+export interface BacktestReport {
+  coin:              string;
+  interval:          string;
+  start_ms:          number;
+  end_ms:            number;
+  replayed_start_ms: number | null;
+  replayed_end_ms:   number | null;
+  ticks:             number;
+  markets:           number;
+  params: {
+    spread:     string;
+    depth:      string;
+    commission: string;
+    strategies: string[] | null;
+    llm_score:  boolean;
+  };
+  native_ledger: {
+    note:                string;
+    starting_collateral: string;
+    realized_pnl:        string;
+    final_equity:        string;
+    closed_trades:       number;
+    per_strategy:        BacktestStrategyStat[];
+  };
+  rs_backtester: BacktestRsMetrics | null;
+  llm_scores:    BacktestLlmScore[];
+  fidelity:      string;
+}
+
+/** Full run record — GET /api/backtest/runs/{id}. */
+export interface BacktestRun extends BacktestRunSummary {
+  report: BacktestReport | null;
+  equity: BacktestEquityPoint[] | null;
+  trades: BacktestTrade[] | null;
+}
+
+/** POST /api/backtest/run body — mirrors the CLI args. */
+export interface BacktestRunRequest {
+  coin:        string;
+  start:       string;
+  end:         string;
+  interval?:   string;
+  spread?:     string;
+  depth?:      string;
+  commission?: string;
+  starting?:   string;
+  strategies?: string[];
+  llm_score?:  boolean;
 }
 
 // ── Squadron / CAG types (Phase 3d) ──────────────────────────────────────────

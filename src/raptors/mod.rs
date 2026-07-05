@@ -25,3 +25,13 @@ pub mod price;
 pub mod funding;
 pub mod derivatives;
 pub mod tide;
+
+/// Market-data source selection + centralized per-venue symbol resolution.
+pub mod source;
+/// Shared velocity / acceleration / drift math (used by price + hyperliquid).
+pub mod kinematics;
+
+/// Hyperliquid raptor — one WS task per asset feeding every raptor channel.
+/// Gated behind the additive `hyperliquid` cargo feature (pulls in the SDK).
+#[cfg(feature = "hyperliquid")]
+pub mod hyperliquid;

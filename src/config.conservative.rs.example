@@ -26,9 +26,32 @@ pub const ENABLE_X: bool = false;
 // ARBITRAGE STRATEGY PARAMETERS
 // ============================================================================
 
-/// Dry-run mode — logs trades without executing them on-chain.
-/// ⚠️ Set to `false` only after validating signals in ghost mode for 30+ minutes.
+/// Seed value for the runtime GHOST/LIVE toggle only.
+///
+/// This constant seeds `DynamicConfig.ghost_mode` on first boot and is recorded in
+/// the startup config-history snapshot. It NO LONGER gates order placement at
+/// runtime: the intl_clob patrol reads the hot-patchable `DynamicConfig`/
+/// `OrderParams.ghost_mode` (Control Tower GHOST/LIVE toggle) for new entries, and
+/// each open position permanently carries the mode it was opened under. Editing
+/// this value changes only the initial toggle state, not live behaviour mid-session.
+/// ⚠️ Validate signals in ghost mode for 30+ minutes before flipping the runtime toggle to LIVE.
 pub const GHOST_MODE: bool = false;
+
+/// Paper (ghost) trading starting collateral, in pUSD. The simulated ledger is
+/// seeded with this amount; ghost entries debit their cost and are rejected when
+/// the ledger is insufficient, ghost exits/settlements credit their proceeds.
+pub const PAPER_STARTING_COLLATERAL: Decimal = dec!(1000);
+
+/// Extra slippage applied to the depth-overflow tranche of a simulated (ghost)
+/// taker fill — the portion of an order that exceeds the best-level depth. Added
+/// to the ask on entries and subtracted from the bid on exits.
+pub const PAPER_OVERFLOW_SLIPPAGE: Decimal = dec!(0.02);
+
+/// Consecutive patrol ticks a simulated (ghost) resting maker BUY quote must be at
+/// or above the market's best bid before it is treated as filled — a documented
+/// queue-position heuristic replacing the old instant maker fill.
+pub const PAPER_MAKER_FILL_TICKS: u64 = 3;
+
 pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 
 /// Requires a wider margin before entering arbitrage — fewer trades, higher quality.
@@ -304,6 +327,18 @@ pub const DERIVATIVES_POLL_SECS: u64 = 30;
 pub const DERIV_GATE_ENABLED: bool = false;
 pub const DERIV_CVD_CONFIRM_MARGIN: Decimal = dec!(0.15);
 pub const DERIV_OI_UNWIND_BLOCK: Decimal = dec!(-0.05);
+
+// ============================================================================
+// MARKET DATA SOURCE
+// ============================================================================
+// Which external source feeds the raptor layer (spot price, velocity, funding,
+// open interest, taker flow). `binance` (default) uses Binance Spot WS + FAPI
+// REST; `hyperliquid` uses the Hyperliquid Info API (one WS raptor per asset,
+// trades → oracle/velocity/CVD, activeAssetCtx → funding(×8)/OI). The env var
+// MARKET_DATA_SOURCE overrides this. `hyperliquid` requires the default cargo
+// features (the SDK is gated behind the additive `hyperliquid` feature); without
+// it the engine logs an error and falls back to Binance.
+pub const MARKET_DATA_SOURCE: &str = "binance";  // binance | hyperliquid (env MARKET_DATA_SOURCE overrides)
 
 // ============================================================================
 // TIDE RAPTOR — "Institutional Pulse" spot-BTC-ETF premium signal
@@ -738,6 +773,25 @@ pub const LLM_OLLAMA_URL: &str = "http://localhost:11434";
 
 /// Default Ollama model.  Override with `OLLAMA_MODEL` env var.
 pub const LLM_OLLAMA_MODEL: &str = "llama3.2";
+
+/// LLM provider backend for the advisor: ollama | anthropic | openai |
+/// openai-compatible | chatgpt.  Default `ollama` preserves the historical
+/// behaviour (local/remote Ollama).  Override with the `LLM_PROVIDER` env var.
+pub const LLM_PROVIDER: &str = "ollama";
+
+/// Generic model name for the selected provider.  "" = use `LLM_OLLAMA_MODEL`
+/// for ollama, otherwise the provider's own default.  Override with `LLM_MODEL`.
+pub const LLM_MODEL: &str = "";
+
+/// Generic base-URL override (ollama / openai-compatible / optional openai or
+/// anthropic override).  "" = provider default (ollama falls back to
+/// `LLM_OLLAMA_URL`).  Override with `LLM_BASE_URL`.
+pub const LLM_BASE_URL: &str = "";
+
+/// Inference timeout (seconds) for CLOUD providers
+/// (anthropic / openai / openai-compatible / chatgpt).  Ollama keeps using
+/// `LLM_INFERENCE_TIMEOUT_SECS` because local CPU inference is much slower.
+pub const LLM_CLOUD_TIMEOUT_SECS: u64 = 120;
 
 
 // ============================================================================

@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use chrono::Utc;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
@@ -52,7 +51,7 @@ impl Strategy for BasisStrategyImpl {
 
         // ── Expiry guard ─────────────────────────────────────────────────────
         if let Some(close_time) = market.market_close_time {
-            let secs_left = (close_time - Utc::now()).num_seconds();
+            let secs_left = (close_time - ctx.wall_now).num_seconds();
             if secs_left < config::BASIS_MIN_SECS_TO_EXPIRY {
                 return Ok(StrategySignal::NoSignal);
             }
@@ -62,7 +61,7 @@ impl Strategy for BasisStrategyImpl {
         // Stale snapshot depth/price values can let OBI and mid-price gates pass
         // silently when the actual live book has moved adversely.
         // GBoost and TimeDecay both gate on snapshot age; same protection here.
-        let snap_age = (Utc::now() - snap.timestamp).num_seconds();
+        let snap_age = (ctx.wall_now - snap.timestamp).num_seconds();
         if snap_age > config::BASIS_MAX_SNAPSHOT_AGE_SECS {
             return Ok(StrategySignal::NoSignal);
         }
@@ -306,7 +305,7 @@ impl Strategy for BasisStrategyImpl {
             if avg_entry <= dec!(0) { continue; }
 
             let profit_margin = (position_bid - avg_entry) / avg_entry;
-            let now = Utc::now();
+            let now = ctx.wall_now;
             let secs_held = (now - position.opened_at).num_seconds();
 
             // Recompute current YES mid to detect skew-collapse
@@ -393,7 +392,7 @@ impl Strategy for BasisStrategyImpl {
             }
 
             if let Some(close_time) = position.close_time {
-                let secs_left = (close_time - Utc::now()).num_seconds();
+                let secs_left = (close_time - ctx.wall_now).num_seconds();
                 if secs_left < config::BASIS_MIN_SECS_TO_EXPIRY / 2 {
                     // Skip BasisExpiry if the bid is too thin to get a FAK fill — near market
                     // close the order book dries up and FAK returns 0 fills while the position

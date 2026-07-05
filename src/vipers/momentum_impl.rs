@@ -142,7 +142,7 @@ impl Strategy for MomentumStrategyImpl {
 
         // ── Expiry guard ──────────────────────────────────────────────────────
         if let Some(close_time) = ctx.market.market_close_time {
-            let secs_left = (close_time - chrono::Utc::now()).num_seconds();
+            let secs_left = (close_time - ctx.wall_now).num_seconds();
             if secs_left < config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY {
                 debug!(" Momentum entry blocked: only {}s to expiry (min {}s)",
                     secs_left, config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY);
@@ -162,7 +162,7 @@ impl Strategy for MomentumStrategyImpl {
         //   Heartbeat showed YES OBI=−0.94 (strongly adverse) but evaluation used
         //   the very first WS depth tick on the new subscription — book hadn't
         //   settled to its equilibrium state yet.
-        let secs_since_market_start = (chrono::Utc::now() - ctx.market_started_at).num_seconds();
+        let secs_since_market_start = (ctx.wall_now - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::MOMENTUM_MARKET_WARMUP_SECS {
             debug!(" Momentum entry blocked: market warmup period ({}s < {}s min)",
                 secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS);
@@ -170,7 +170,7 @@ impl Strategy for MomentumStrategyImpl {
         }
 
         // ── Snapshot staleness gate ───────────────────────────────────────────
-        let snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
+        let snap_age = (ctx.wall_now - ctx.snapshot.timestamp).num_seconds();
         if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
             debug!(" Momentum entry blocked: snapshot too stale ({}s > max {}s)",
                 snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS);
@@ -429,7 +429,7 @@ impl Strategy for MomentumStrategyImpl {
                 continue
             };
 
-            let secs_held = (chrono::Utc::now() - position.opened_at).num_seconds();
+            let secs_held = (ctx.wall_now - position.opened_at).num_seconds();
             if position.fill_confirmed_at.is_none() {
                 let profit_margin_check = (bid - position.avg_entry) / position.avg_entry;
                 if secs_held < config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS {
@@ -493,7 +493,7 @@ impl Strategy for MomentumStrategyImpl {
             // Use net profit (after sell offset) for the hold threshold so we don't
             // artificially "hold" a position that is break-even or negative net of costs.
             if let Some(close_time) = exit_close_time {
-                let secs_left = (close_time - chrono::Utc::now()).num_seconds();
+                let secs_left = (close_time - ctx.wall_now).num_seconds();
                 let net_profit_for_expiry = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
                 if secs_left <= config::MOMENTUM_EXPIRY_EXIT_SECS && net_profit_for_expiry < config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD {
                     let reason = format!("NearExpiry: bid=${:.4}, net_profit={:.2}%", bid, net_profit_for_expiry * dec!(100));

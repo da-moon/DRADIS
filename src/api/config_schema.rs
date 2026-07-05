@@ -76,7 +76,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
 
     // ── Global ────────────────────────────────────────────────────────────────
     v.push(F::new("Global", None, "ghost_mode", "Ghost Mode", "bool", false,
-        "Simulate all orders — no real CLOB calls (validation framework)."));
+        "Paper-trade NEW orders — depth-aware simulated fills, no real CLOB calls. Reaches running squadrons within ~30s and affects new orders only: open live positions keep trading live until they close (grandfathered); ghost positions stay simulated."));
 
     // ── Arbitrage ───────────────────────────────────────────────────────────────
     {

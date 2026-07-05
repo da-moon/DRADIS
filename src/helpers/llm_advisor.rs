@@ -26,24 +26,27 @@
 ///
 /// ── Configuration ────────────────────────────────────────────────────────────
 ///   config.rs:       ENABLE_LLM_ADVISOR, LLM_ADVISOR_INTERVAL_SECS,
-///                    LLM_ADVISOR_TRADES_LOOKBACK, LLM_OLLAMA_URL, LLM_OLLAMA_MODEL
-///   env overrides:   OLLAMA_URL, OLLAMA_MODEL  (override the defaults above)
+///                    LLM_PROVIDER, LLM_MODEL, LLM_BASE_URL, LLM_CLOUD_TIMEOUT_SECS,
+///                    LLM_OLLAMA_URL, LLM_OLLAMA_MODEL
+///   env overrides:   LLM_PROVIDER, LLM_MODEL, LLM_BASE_URL, and provider keys
+///                    (ANTHROPIC_API_KEY / OPENAI_API_KEY / CHATGPT_ACCESS_TOKEN);
+///                    legacy OLLAMA_URL, OLLAMA_MODEL still honoured for ollama.
 ///   Telegram creds:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (same as rest of bot)
 ///
 /// ── Bring Your Own LLM ───────────────────────────────────────────────────────
-/// The advisor uses the Ollama /api/chat endpoint (OpenAI-compatible).
-/// Any model running in Ollama works.  Recommended: llama3.2, mistral, qwen2.5.
-/// Point OLLAMA_URL at a remote host for GPU-accelerated inference when running
-/// DRADIS on a headless cloud VPS.
+/// The provider is selected at runtime (see `helpers::llm_client`): `ollama`
+/// (default, local/remote — the historical behaviour), `anthropic`, `openai`,
+/// `openai-compatible` (vLLM / LM Studio / OpenRouter / Groq …) and `chatgpt`
+/// (OAuth subscription).  All provider-specific wiring lives in `llm_client.rs`;
+/// this loop only ever sees a `Box<dyn LlmChat>`.
 
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
 use crate::config;
+use crate::helpers::llm_client::{self, LlmChat};
 use crate::helpers::{db, dynamic_config::DynamicConfig, notifications};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -58,39 +61,10 @@ const LLM_ADVISOR_MIN_SESSION_TRADES: usize = 5;
 /// Kept low (5) to avoid prompt bloat — a 3b CPU model struggles past ~1500 input tokens.
 const LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT: i64 = 5;
 
-// ── Ollama API types ──────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct OllamaRequest {
-    model: String,
-    messages: Vec<OllamaMessage>,
-    stream: bool,
-    /// Optional generation parameters — keep output focused and concise.
-    options: OllamaOptions,
-}
-
-#[derive(Serialize)]
-struct OllamaOptions {
-    /// Allow fuller recommendations to be persisted to SQLite and shown in Control Tower.
-    /// Telegram truncation is handled separately after generation.
-    num_predict: u32,
-    temperature: f32,
-    /// Cap the KV-cache context window.  Smaller = faster prefill on CPU.
-    /// 3072 leaves room for the prompt plus a longer recommendation.
-    num_ctx: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct OllamaMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct OllamaResponse {
-    message: OllamaMessage,
-    done_reason: Option<String>,
-}
+// ── LLM backend ───────────────────────────────────────────────────────────────
+// Provider selection, request/response wiring, timeouts and probing all live in
+// `helpers::llm_client` behind the `LlmChat` trait.  This module only builds the
+// prompts and drives the retry/notify loop.
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -404,65 +378,6 @@ fn build_user_prompt(
     lines.join("\n")
 }
 
-// ── Ollama API call ───────────────────────────────────────────────────────────
-
-/// Quick reachability probe: GET /api/tags with a short timeout.
-/// Returns Ok(()) if Ollama is up, Err otherwise.
-async fn probe_ollama(probe_client: &Client, ollama_base_url: &str) -> anyhow::Result<()> {
-    let url = format!("{}/api/tags", ollama_base_url.trim_end_matches('/'));
-    let resp = probe_client.get(&url).send().await?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Ollama /api/tags returned HTTP {}", resp.status()))
-    }
-}
-
-async fn call_ollama(
-    client: &Client,
-    ollama_base_url: &str,
-    model: &str,
-    user_prompt: &str,
-) -> anyhow::Result<OllamaResponse> {
-    let url = format!("{}/api/chat", ollama_base_url.trim_end_matches('/'));
-
-    let request = OllamaRequest {
-        model: model.to_string(),
-        messages: vec![
-            OllamaMessage {
-                role: "system".to_string(),
-                content: system_prompt(),
-            },
-            OllamaMessage {
-                role: "user".to_string(),
-                content: user_prompt.to_string(),
-            },
-        ],
-        stream: false,
-        options: OllamaOptions {
-            num_predict: 900,
-            temperature: 0.3, // Low temperature: consistent, factual recommendations
-            num_ctx: 3072,     // Room for prompt + full recommendation without frequent length stops
-        },
-    };
-
-    let resp = client
-        .post(&url)
-        .json(&request)
-        .send()
-        .await?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Ollama HTTP {}: {}", status, body));
-    }
-
-    let mut ollama_resp: OllamaResponse = resp.json().await?;
-    ollama_resp.message.content = ollama_resp.message.content.trim().to_string();
-    Ok(ollama_resp)
-}
-
 // ── Main advisor loop ─────────────────────────────────────────────────────────
 
 /// Spawn this as a long-running tokio task at startup.
@@ -494,45 +409,36 @@ pub async fn run_llm_advisor_loop(
         return;
     }
 
-    // Resolve Ollama connection settings — env vars override compile-time defaults.
-    let ollama_url = std::env::var("OLLAMA_URL")
-        .unwrap_or_else(|_| config::LLM_OLLAMA_URL.to_string());
-    let ollama_model = std::env::var("OLLAMA_MODEL")
-        .unwrap_or_else(|_| config::LLM_OLLAMA_MODEL.to_string());
+    // Resolve provider + connection settings once at task start (NOT hot-reloaded).
+    // Legacy OLLAMA_URL/OLLAMA_MODEL are still honoured for the ollama provider.
+    let settings = match llm_client::LlmSettings::resolve_from_env() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("🤖 LLM Advisor: configuration error, task exiting: {:#}", e);
+            return;
+        }
+    };
 
+    // Build the provider client.  All rig/HTTP wiring + timeout enforcement lives
+    // in `llm_client`; a build failure degrades (task exits) rather than panics.
+    let client: Box<dyn LlmChat> = match llm_client::build_client(&settings) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("🤖 LLM Advisor: failed to build LLM client, task exiting: {:#}", e);
+            return;
+        }
+    };
+
+    // Startup log states provider + model + base URL.  API keys are NEVER logged.
     info!(
-        "🤖 LLM Advisor started (CAG multi-asset mode) — model: {} @ {} | interval: {}s | session: {}",
-        ollama_model,
-        ollama_url,
+        "🤖 LLM Advisor started (CAG multi-asset mode) — provider: {} | model: {} | base_url: {} | timeout: {}s | interval: {}s | session: {}",
+        settings.provider.as_str(),
+        settings.model,
+        settings.base_url_display(),
+        settings.timeout_secs,
         config::LLM_ADVISOR_INTERVAL_SECS,
         db::current_session_id(),
     );
-
-    // Two HTTP clients with different timeout profiles:
-    //
-    // probe_client — used for the pre-flight GET /api/tags health-check.
-    //   connect_timeout: 5 s  (fail fast if the container/host is unreachable)
-    //   timeout:        10 s  (total; /api/tags returns in <1 s when healthy)
-    //
-    // inference_client — used for the actual POST /api/chat.
-    //   connect_timeout: 10 s  (fast TCP failure; prevents silent hangs)
-    //   timeout:        480 s  (LLM_INFERENCE_TIMEOUT_SECS — measured on t3.large
-    //                           qwen2.5:3b takes ~360–400s; 480s gives a 20% buffer)
-    //
-    // Previously the timeout was 360s — exactly at the model's natural completion
-    // time — causing every first attempt to time out, triggering needless retry cycles
-    // that collectively consumed 12–17 min of a 30-min advisory interval.
-    let probe_client = Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-
-    let http_client = Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(config::LLM_INFERENCE_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_default();
 
     // Skip the first tick so we don't fire immediately at startup before any
     // trades have occurred.
@@ -633,13 +539,14 @@ pub async fn run_llm_advisor_loop(
         let total_trade_count = session_trade_count
             + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
 
-        // ── Pre-flight: verify Ollama is reachable before a 6-min inference call ──
-        // Uses the fast probe_client (5 s connect / 10 s total).
-        // On failure we skip this cycle entirely rather than blocking the loop.
-        if let Err(e) = probe_ollama(&probe_client, &ollama_url).await {
+        // ── Pre-flight: verify the backend is reachable before a long inference ──
+        // For ollama this is a fast GET /api/tags (5 s connect / 10 s total);
+        // cloud providers skip probing (default Ok).  On failure we skip this
+        // cycle entirely rather than blocking the loop.
+        if let Err(e) = client.probe().await {
             warn!(
-                "🤖 LLM Advisor: Ollama unreachable at {} — skipping cycle ({})",
-                ollama_url, e
+                "🤖 LLM Advisor: backend unreachable ({} @ {}) — skipping cycle ({})",
+                settings.provider.as_str(), settings.base_url_display(), e
             );
             continue;
         }
@@ -658,7 +565,7 @@ pub async fn run_llm_advisor_loop(
 
         info!(
             "🤖 LLM Advisor: calling {} for session {} ({} session + {} prior trades, P&L ${:.2})...",
-            ollama_model,
+            client.model_tag(),
             &session_id[..16.min(session_id.len())],
             session_trade_count,
             total_trade_count - session_trade_count,
@@ -666,6 +573,8 @@ pub async fn run_llm_advisor_loop(
         );
 
         // Retry up to 2 times with a 30-second backoff on transient errors.
+        // (Per-request timeouts + any length-cap warning are handled inside the
+        // provider client; here we only orchestrate retries.)
         const MAX_RETRIES: u32 = 2;
         let mut last_err = String::new();
         let mut analysis_opt: Option<String> = None;
@@ -677,19 +586,13 @@ pub async fn run_llm_advisor_loop(
                 );
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
-            match call_ollama(&http_client, &ollama_url, &ollama_model, &user_prompt).await {
-                Ok(resp) => {
-                    if matches!(resp.done_reason.as_deref(), Some("length")) {
-                        warn!(
-                            "🤖 LLM Advisor: output hit Ollama length cap (num_predict={}) — consider increasing if recommendations still end mid-thought",
-                            900,
-                        );
-                    }
-                    analysis_opt = Some(resp.message.content);
+            match client.chat(&system_prompt(), &user_prompt).await {
+                Ok(analysis) => {
+                    analysis_opt = Some(analysis);
                     break;
                 }
                 Err(e) => {
-                    last_err = e.to_string();
+                    last_err = format!("{:#}", e);
                 }
             }
         }
@@ -703,7 +606,7 @@ pub async fn run_llm_advisor_loop(
                 // Write to primary pool (main CAG dashboard reads from there).
                 db::record_llm_recommendation(
                     &primary_pool,
-                    &ollama_model,
+                    &client.model_tag(),
                     total_trade_count as i64,
                     current_pnl,
                     &analysis,
@@ -728,8 +631,8 @@ pub async fn run_llm_advisor_loop(
             }
             None => {
                 error!(
-                    "🤖 LLM Advisor: Ollama call failed after {} retries ({}@{}): {}",
-                    MAX_RETRIES, ollama_model, ollama_url, last_err
+                    "🤖 LLM Advisor: LLM call failed after {} retries ({} @ {}): {}",
+                    MAX_RETRIES, client.model_tag(), settings.base_url_display(), last_err
                 );
             }
         }

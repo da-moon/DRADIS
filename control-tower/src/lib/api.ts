@@ -1,4 +1,4 @@
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample, BacktestRunSummary, BacktestRun, BacktestRunRequest } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -155,6 +155,62 @@ export async function patchSquadronConfig(squadronId: string, patch: Partial<Dyn
     cache: 'no-store',
   });
   if (!res.ok) throw new Error(`PATCH /api/squadrons/${squadronId}/config → ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+// ── Backtest (feature-gated backend) ─────────────────────────────────────────
+//
+// The backtest routes exist ONLY when the server was built with `--features
+// backtest`. On a default build they are absent (404). `probeBacktest` lets the
+// dashboard hide the Backtest tab entirely rather than surfacing dead UI.
+
+/** Probe whether the backtest API is present.
+ *
+ * Hide the Backtest tab ONLY when the routes are genuinely absent (404 on a
+ * default build). A transient failure — 503 while the engine restarts, a 401
+ * auth hiccup, or a network error — must NOT permanently hide the tab: the probe
+ * fires once per page session (refreshInterval 0), so conflating those with 404
+ * would keep the tab hidden until a full reload even after the engine recovers.
+ * On anything other than a definitive 404 we return true and let the tab's own
+ * data hooks surface errors / self-heal, exactly like every other tab. */
+export async function probeBacktest(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BASE}/api/backtest/runs`, { cache: 'no-store', headers: buildHeaders() });
+    // 404 → feature-gated routes are absent → hide. Any other status (200, or a
+    // transient 5xx/401) → treat as present so a routine restart doesn't hide the tab.
+    return res.status !== 404;
+  } catch {
+    // Network error (engine unreachable mid-restart) → don't permanently hide; show.
+    return true;
+  }
+}
+
+export async function getBacktestRuns(): Promise<BacktestRunSummary[]> {
+  const res = await fetch(`${BASE}/api/backtest/runs`, { cache: 'no-store', headers: buildHeaders() });
+  if (!res.ok) throw new Error(`GET /api/backtest/runs → ${res.status}`);
+  return res.json();
+}
+
+export async function getBacktestRun(id: string): Promise<BacktestRun> {
+  const res = await fetch(`${BASE}/api/backtest/runs/${encodeURIComponent(id)}`, { cache: 'no-store', headers: buildHeaders() });
+  if (!res.ok) throw new Error(`GET /api/backtest/runs/${id} → ${res.status}`);
+  return res.json();
+}
+
+/** Start a backtest run. Returns `{ id, status }` on 202, or throws (409 while a
+ *  run is in progress, 400 on bad params) with the server's error text. */
+export async function runBacktest(body: BacktestRunRequest): Promise<{ id: string; status: string }> {
+  const res = await fetch(`${BASE}/api/backtest/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...buildHeaders() },
+    body: JSON.stringify(body),
+    cache: 'no-store',
+  });
+  if (!res.ok) {
+    let msg = `${res.status}`;
+    try { const j = await res.json(); if (j?.error) msg = j.error; } catch { /* non-JSON body */ }
+    throw new Error(msg);
+  }
   return res.json();
 }
 

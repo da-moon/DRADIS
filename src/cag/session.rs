@@ -61,7 +61,22 @@ pub struct SessionState {
     pub pending_orders: Arc<Mutex<HashMap<(String, MarketId), Instant>>>,
 
     /// Accumulated session P&L (realised on confirmed exits).
+    ///
+    /// LIVE-ONLY: since paper trading was split out, ghost exits/settlements no
+    /// longer book here — they book into [`Self::paper_pnl`]. This makes the
+    /// headline session P&L a clean live-money figure.
     pub total_pnl: Arc<Mutex<Decimal>>,
+
+    /// Accumulated *paper* (ghost) session P&L — realised on simulated ghost
+    /// exits and expiry settlements. Segregated from `total_pnl` so live and
+    /// paper track records never commingle.
+    pub paper_pnl: Arc<Mutex<Decimal>>,
+
+    /// Simulated paper collateral ledger, seeded from
+    /// `config::PAPER_STARTING_COLLATERAL`. Ghost entries debit their cost (and
+    /// are rejected when the ledger is insufficient); ghost exits and expiry
+    /// settlements credit their proceeds. Never touches real pUSD.
+    pub paper_balance: Arc<Mutex<Decimal>>,
 
     /// Live pUSD collateral balance polled from the CLOB API every ~60 s.
     /// Strategies read this to self-gate on insufficient funds before placing
@@ -146,6 +161,8 @@ impl SessionState {
             positions:            Arc::new(Mutex::new(PositionMap::new())),
             pending_orders:       Arc::new(Mutex::new(HashMap::new())),
             total_pnl:            Arc::new(Mutex::new(dec!(0))),
+            paper_pnl:            Arc::new(Mutex::new(dec!(0))),
+            paper_balance:        Arc::new(Mutex::new(crate::config::PAPER_STARTING_COLLATERAL)),
             live_collateral:      Arc::new(Mutex::new(startup_balance)),
             starting_collateral:  Arc::new(Mutex::new(startup_balance)),
             phantom_cooldowns:    Arc::new(Mutex::new(HashMap::new())),

@@ -419,6 +419,7 @@ async fn trade_one_market(
                             shares,
                             pnl,
                             "LifecycleFlatten".to_string(),
+                            false,
                         ).await;
                     });
                 }
@@ -475,6 +476,11 @@ async fn trade_one_market(
             available_collateral,
             dynamic_config: dyn_cfg.clone(),
             arb_market_lockouts: None,
+            // Clock seam (W1): one consistent now per tick for all viper gates.
+            wall_now: Utc::now(),
+            mono_now: std::time::Instant::now(),
+            // Live trader — never a replay; vipers may consult live DB state.
+            is_replay: false,
         };
 
         // Evaluate the resolved vipers and dispatch whatever they decide.
@@ -595,6 +601,7 @@ async fn record_guard(
             pair_token_id: params.token_id.clone(),
             fill_confirmed_at: None,
             paired_leg_token_id: paired.cloned(),
+            ghost: params.ghost_mode,
         },
     );
 }

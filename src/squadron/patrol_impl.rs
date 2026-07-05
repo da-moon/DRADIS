@@ -5,10 +5,11 @@
 ///
 /// Phase 3f-4: peripheral tickers (pulse, settlement, cleanup, status, watchdog)
 /// are lifted into independent Tokio tasks spawned via `patrol_tasks.rs`.
-/// The core `select!` now has exactly three arms:
-///   1. `cancel.cancelled()`       — CAG/watchdog stand-down
-///   2. `ctx.market_rx.changed()`  — market rotation
-///   3. `ticker.tick()`            — strategy evaluation
+/// The core `select!` now has four arms:
+///   1. `cancel.cancelled()`             — CAG/watchdog stand-down
+///   2. `ctx.market_rx.changed()`        — market rotation
+///   3. `config_reload_ticker.tick()`    — periodic squadron-config reload
+///   4. `ticker.tick()`                  — strategy evaluation
 
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use crate::orchestrator::executor::{execute_strategies_concurrent, aggregate_and
 use crate::helpers::{
     balance::*, orders::*,
     notifications::{send_notification, tweet_trade}, metrics, db,
+    dynamic_config::DynamicConfig,
 };
 use crate::squadron::Squadron;
 use super::context::PatrolContext;
@@ -51,6 +53,30 @@ const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e0052001052000
 
 const MAX_CANCEL_RETRIES: u32 = 5;
 const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200;
+
+/// How often the intl patrol reloads its squadron-scoped `DynamicConfig` from the
+/// DB so Control Tower edits (e.g. the GHOST/LIVE toggle or a viper enable flag)
+/// take effect on a *running* squadron without waiting for the next hourly market
+/// rotation. Mirrors the us_retail venue's `DASHBOARD_SYNC_SECS` reload
+/// (`venues/us/trader.rs`).
+const SQUADRON_CONFIG_RELOAD_SECS: u64 = 30;
+
+/// A simulated resting ghost maker BUY quote (D5).
+///
+/// Held in the patrol loop's local registry keyed by `(strategy, token)`. Each
+/// patrol tick advances `consecutive_ticks` while the market's best bid sits at or
+/// below the quote price; once it has rested `config::PAPER_MAKER_FILL_TICKS` ticks
+/// the quote is treated as filled — a documented queue-position heuristic replacing
+/// the old instant ghost maker fill.
+#[derive(Clone)]
+struct GhostRestingQuote {
+    price: Decimal,
+    shares: Decimal,
+    market_name: String,
+    /// "YES" / "NO" — captured at registration for the entries/open_positions rows.
+    side: String,
+    consecutive_ticks: u64,
+}
 
 impl Squadron {
     /// Run the squadron's full patrol lifecycle.
@@ -79,6 +105,8 @@ impl Squadron {
         let positions             = ctx.session.positions.clone();
         let pending_orders        = ctx.session.pending_orders.clone();
         let total_pnl             = ctx.session.total_pnl.clone();
+        let paper_pnl             = ctx.session.paper_pnl.clone();
+        let paper_balance         = ctx.session.paper_balance.clone();
         let live_collateral       = ctx.session.live_collateral.clone();
         let starting_collateral_store = ctx.session.starting_collateral.clone();
         let phantom_cooldowns     = ctx.session.phantom_cooldowns.clone();
@@ -219,6 +247,10 @@ impl Squadron {
             tg_token.clone(),
             tg_chat_id.clone(),
             asset_lc.clone(),
+            oracle_rx.clone(),
+            hourly_strike_price,
+            paper_pnl.clone(),
+            paper_balance.clone(),
             peripheral_cancel.clone(),
         );
 
@@ -370,7 +402,15 @@ impl Squadron {
         let patrol_venue = std::sync::Arc::clone(&ctx.session.venue);
 
         // ── Core tick loop: 3 arms ────────────────────────────────────────────
+        // D5: simulated resting ghost maker quotes. Local to this patrol() call, so
+        // it is dropped (all quotes cancelled) on every market rotation — the same
+        // net effect as live GTC orders being cancelled at rotation.
+        let mut ghost_maker_quotes: std::collections::HashMap<(String, MarketId), GhostRestingQuote> =
+            std::collections::HashMap::new();
         let mut ticker = interval(config::main_ticker_interval());
+        // Periodic squadron-config reload (see SQUADRON_CONFIG_RELOAD_SECS). Lets
+        // Control Tower edits reach this running patrol between market rotations.
+        let mut config_reload_ticker = interval(Duration::from_secs(SQUADRON_CONFIG_RELOAD_SECS));
         loop {
             tokio::select! {
                 biased;
@@ -401,6 +441,50 @@ impl Squadron {
                         continue;
                     }
                     info!("🔄 Market switch detected — restarting trading loop with new market context");
+
+                    // D6 fix: settle GHOST (paper) positions for the market(s) being rotated
+                    // away, BEFORE this patrol tears down. Hourly markets rotate ~12 min before
+                    // close — far outside cleanup_expired_positions' 60s settlement window — and
+                    // the per-patrol cleanup task dies with the patrol, so without this ghost
+                    // positions strand in the shared position map with paper collateral
+                    // permanently debited. `force = true` settles regardless of the window and
+                    // removes ONLY ghost legs; live positions are grandfathered / settled on-chain.
+                    {
+                        let oracle_now = *oracle_rx.borrow();
+                        if new_hourly_condition_id != current_hourly_cid
+                            && hourly_yes_token != market_id_from_u256(U256::ZERO)
+                        {
+                            crate::tasks::cleanup::cleanup_expired_positions(
+                                Arc::clone(&positions),
+                                hourly_market_name.clone(),
+                                hourly_yes_token.clone(), hourly_no_token.clone(),
+                                hourly_market_close_time,
+                                hourly_strike_price,
+                                oracle_now,
+                                Arc::clone(&paper_pnl),
+                                Arc::clone(&paper_balance),
+                                asset_lc.clone(),
+                                true,
+                            ).await;
+                        }
+                        if let Some(ref mk) = maker_market_config {
+                            if new_maker_cid != current_maker_cid {
+                                crate::tasks::cleanup::cleanup_expired_positions(
+                                    Arc::clone(&positions),
+                                    mk.market_name.clone(),
+                                    mk.yes_token.clone(), mk.no_token.clone(),
+                                    mk.market_close_time,
+                                    mk.strike_price,
+                                    oracle_now,
+                                    Arc::clone(&paper_pnl),
+                                    Arc::clone(&paper_balance),
+                                    asset_lc.clone(),
+                                    true,
+                                ).await;
+                            }
+                        }
+                    }
+
                     let mut cancel_success = false;
                     for i in 0..MAX_CANCEL_RETRIES {
                         let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
@@ -442,7 +526,28 @@ impl Squadron {
                     self.cancel_ws();
                     break;
                 }
-                // ── 3. Strategy evaluation tick ─────────────────────────────────
+                // ── 3. Periodic squadron-config reload ──────────────────────────
+                // Refresh ctx.dynamic_config from this squadron's DB row so a
+                // Control Tower toggle (GHOST/LIVE, viper enable, tuning) applied
+                // via PATCH /api/config (fanned out per-squadron) or
+                // PATCH /api/squadrons/{id}/config lands on the live patrol within
+                // ~SQUADRON_CONFIG_RELOAD_SECS instead of only on the next rotation.
+                _ = config_reload_ticker.tick() => {
+                    // Load first (async DB read), THEN take the write guard. The
+                    // guard is a std RwLock, not tokio's — it must never be held
+                    // across an .await, so the load completes before we lock.
+                    let reloaded = DynamicConfig::load_for_squadron(&self.id).await;
+                    let ghost_changed = {
+                        let mut guard = dynamic_config.write().unwrap();
+                        let prev_ghost = guard.ghost_mode;
+                        *guard = (*reloaded).clone();
+                        prev_ghost != guard.ghost_mode
+                    };
+                    if ghost_changed {
+                        debug!("⚙️  Squadron [{}] config reload: ghost_mode → {}", self.id, reloaded.ghost_mode);
+                    }
+                }
+                // ── 4. Strategy evaluation tick ─────────────────────────────────
                 _ = ticker.tick() => {
                     // Skip evaluation this tick if the market has changed — yield to arm 2.
                     if ctx.market_rx.has_changed().unwrap_or(false) { continue; }
@@ -531,6 +636,13 @@ impl Squadron {
                         }),
                         dynamic_config: dyn_cfg,
                         arb_market_lockouts: Some(arb_market_lockouts.clone()),
+                        // Clock seam (W1): capture one consistent now for all viper
+                        // gates this tick. Behaviour-identical to the pre-seam direct
+                        // Utc::now()/Instant::now() calls, just sampled once here.
+                        wall_now: Utc::now(),
+                        mono_now: std::time::Instant::now(),
+                        // Live patrol — never a replay; vipers may consult live DB state.
+                        is_replay: false,
                     };
 
                     let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500, &mut last_executor_summary).await {
@@ -538,7 +650,10 @@ impl Squadron {
                         Err(e) => { warn!("⚠️ Strategy evaluation error: {}", e); continue; }
                     };
                     let (resolved_signals, _) = aggregate_and_resolve_signals(&eval_result);
-                    if resolved_signals.is_empty() { continue; }
+                    // NOTE: do NOT `continue` on empty signals here — the D5 resting-ghost-quote
+                    // advance/fill sweep at the tail of this arm must run EVERY tick so quotes
+                    // accrue queue time even on ticks that produced no new signals. An empty
+                    // `resolved_signals` simply makes the for-loop below a no-op.
 
                     // ── Signal-processing timeout guard (45 s) ───────────────────────
                     let signal_processing_result = tokio::time::timeout(Duration::from_secs(45), async {
@@ -568,14 +683,46 @@ impl Squadron {
                                 let tid = params.token_id;
                                 let tid_m = tid.clone(); // neutral key (slice 2a)
                                 let pos_key = (sn.clone(), tid_m.clone());
-                                let shares = { let map = positions.lock().await; match map.get(&pos_key) { Some(p) => p.shares, None => continue } };
+                                // Position-scoped mode: exits key off the mode the position was
+                                // OPENED under (D1), never the current toggle.
+                                let (shares, pos_ghost) = { let map = positions.lock().await; match map.get(&pos_key) { Some(p) => (p.shares, p.ghost), None => continue } };
                                 if shares < config::MIN_ORDER_SHARES || params.price <= dec!(0) {
-                                    let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { let aep = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep - p.avg_entry) * p.shares; } continue;
+                                    let removed = { let mut map = positions.lock().await; map.remove(&pos_key) };
+                                    if let Some(p) = removed {
+                                        let aep = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                        let pnl = (aep - p.avg_entry) * p.shares;
+                                        if p.ghost {
+                                            *paper_pnl.lock().await += pnl;
+                                            *paper_balance.lock().await += aep * p.shares;
+                                            // Release the token claim and write the same DB trail a normal
+                                            // ghost exit does (trades row + open_positions delete). Without
+                                            // this the paper ledger moves but SUM(pnl) over ghost trades
+                                            // diverges and the open_positions row is left to the stale-purge.
+                                            token_ownership.lock().await.remove(&tid_m);
+                                            if p.shares > dec!(0) {
+                                                let side_d = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
+                                                let m_name = params.market_name.clone();
+                                                let r_d = reason.clone();
+                                                let asset_d = asset_lc.clone();
+                                                let sn_d = sn.clone();
+                                                let sn_close = sn.clone();
+                                                let tid_close = tid_m.clone();
+                                                let re_d = p.avg_entry; let sh_d = p.shares;
+                                                tokio::spawn(async move {
+                                                    metrics::record_trade(&asset_d, sn_d, m_name, side_d, re_d, aep, sh_d, pnl, r_d, true).await;
+                                                    if let Some(pool) = db::pool_for(&asset_d) { db::close_open_position(&pool, &sn_close, &tid_close.to_string()).await; }
+                                                });
+                                            }
+                                        } else {
+                                            *total_pnl.lock().await += pnl;
+                                        }
+                                    }
+                                    continue;
                                 }
                                 info!("🔴 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
                                 let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
-                                if !config::GHOST_MODE {
+                                if !pos_ghost {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
@@ -600,28 +747,74 @@ impl Squadron {
                                             let rs_m;
                                             let rc_m;
                                             let pnl_m;
+                                            let exit_avg_m;
+
+                                            // Exit-side bid depth for the primary leg, from the venue-appropriate
+                                            // snapshot — used only by the ghost depth-aware fill simulation (D4).
+                                            let primary_exit_snap = if target_yes_token == ctx.market.yes_token {
+                                                &ctx.snapshot
+                                            } else {
+                                                ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot)
+                                            };
+                                            let primary_bid_depth = if tid == target_yes_token { primary_exit_snap.yes_bid_depth } else { primary_exit_snap.no_bid_depth };
 
                                             {
                                                 let mut map = positions.lock().await;
                                                 if let Some(p) = map.remove(&pos_key) {
-                                                    let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                    // LIVE: exact prior behaviour — booked at (bid − offset), floored.
+                                                    // GHOST: depth-aware simulated fill (D4) — worse on the overflow tranche.
+                                                    let live_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                    let actual_exit_price = if pos_ghost {
+                                                        crate::helpers::paper::simulate_taker_sell_avg(
+                                                            live_exit_price, primary_bid_depth, p.shares,
+                                                            config::PAPER_OVERFLOW_SLIPPAGE, config::MIN_SELL_LIMIT_PRICE,
+                                                        )
+                                                    } else {
+                                                        live_exit_price
+                                                    };
                                                     let pnl = (actual_exit_price - p.avg_entry) * p.shares;
-                                                    *total_pnl.lock().await += pnl;
+                                                    if pos_ghost {
+                                                        // Paper accounting: segregated P&L + collateral credit (D7).
+                                                        *paper_pnl.lock().await += pnl;
+                                                        *paper_balance.lock().await += actual_exit_price * p.shares;
+                                                    } else {
+                                                        *total_pnl.lock().await += pnl;
+                                                    }
 
                                                     re_m = p.avg_entry;
                                                     rs_m = p.shares;
                                                     rc_m = p.close_time;
                                                     pnl_m = pnl;
+                                                    exit_avg_m = actual_exit_price;
 
-                                                    // NOTE: record_trade and close_open_position are deferred
-                                                    // to the FAK verification block below so we only write to
-                                                    // the DB once the fill is confirmed (not on order placement).
+                                                    // NOTE: for LIVE, record_trade and close_open_position are deferred
+                                                    // to the FAK verification block below so we only write to the DB
+                                                    // once the fill is confirmed (not on order placement). For GHOST
+                                                    // the fill is simulated, so we record immediately below.
                                                 } else { continue; }
                                             }
                                             // Release token claim — position is fully closed.
                                             token_ownership.lock().await.remove(&tid_m);
 
-                                        if rs_m > dec!(0) && !config::GHOST_MODE {
+                                        if pos_ghost {
+                                            // GHOST: no on-chain reconcile. Write the same DB trail a live exit
+                                            // does (trades row + open_positions delete) with the simulated
+                                            // proceeds, so ghost exits no longer strand open_positions rows (W2/D7).
+                                            if rs_m > dec!(0) {
+                                                let sid_m = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
+                                                let m_name = params.market_name.clone();
+                                                let r_m = reason.clone();
+                                                let asset_t = asset_lc.clone();
+                                                let sn_rec = sn.clone();
+                                                let sn_async = sn.clone();
+                                                let tid_async = tid_m.clone();
+                                                info!("👻 [PAPER] EXIT confirmed [{sn_async}]: {rs_m:.4} shares @ ${exit_avg_m:.4} pnl=${pnl_m:.4} (simulated)");
+                                                tokio::spawn(async move {
+                                                    metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, exit_avg_m, rs_m, pnl_m, r_m, true).await;
+                                                    if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
+                                                });
+                                            }
+                                        } else if rs_m > dec!(0) {
                                             let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
                                             let sn_async = sn.clone();
                                             let tid_async = tid_m.clone(); // neutral key moved into the spawn
@@ -631,7 +824,7 @@ impl Squadron {
                                             let r_m = reason.clone();
                                             let asset_t = asset_lc.clone();
                                             let sn_rec = sn.clone();
-                                            let tid_rec = tid.to_string();
+                                            let _tid_rec = tid.to_string();
                                             tokio::spawn(async move {
                                                 tokio::time::sleep(Duration::from_millis(2500)).await;
                                                 let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_async).unwrap_or_default());
@@ -640,7 +833,11 @@ impl Squadron {
                                                 let other_strats_shares = {
                                                     let map = ps.lock().await;
                                                     map.iter()
-                                                        .filter(|((s, t), _)| *t == tid_async && s != &sn_async)
+                                                        // GHOST positions have no on-chain counterpart, so they must
+                                                        // NOT be subtracted from the wallet's real remaining balance —
+                                                        // counting them would understate our_rem and fabricate a
+                                                        // partial live exit against untracked on-chain shares.
+                                                        .filter(|((s, t), p)| *t == tid_async && s != &sn_async && !p.ghost)
                                                         .map(|(_, p)| p.shares)
                                                         .fold(dec!(0), |a, b| a + b)
                                                 };
@@ -652,24 +849,24 @@ impl Squadron {
                                                         warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares (our_rem={:.4}, other_strats={:.4}) — re-inserting for retry.", sn_async, rs_m, our_rem, other_strats_shares);
                                                         let mut map = ps.lock().await;
                                                         if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
-                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, ghost: false });
                                                         }
                                                         // 0 fills — do NOT record to DB; position is re-inserted for retry.
                                                     } else {
                                                         warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} (our_rem={:.4}, other_strats={:.4}) — re-inserting.", sn_async, fill, rs_m, our_rem, other_strats_shares);
                                                         let mut map = ps.lock().await;
                                                         if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
-                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, ghost: false });
                                                         }
                                                         // Partial fill — record only the filled portion.
                                                         let partial_pnl = (aep2 - re_m) * fill;
-                                                        metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, aep2, fill, partial_pnl, r_m).await;
+                                                        metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, aep2, fill, partial_pnl, r_m, false).await;
                                                         if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
                                                     }
                                                 } else {
                                                     // Full fill confirmed — now it's safe to write to DB.
                                                     info!("✅ FAK exit confirmed [{sn_async}]: {rs_m:.4} shares sold @ ${aep_exit:.4} pnl=${pnl_m:.4}");
-                                                    metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, aep_exit, rs_m, pnl_m, r_m).await;
+                                                    metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, aep_exit, rs_m, pnl_m, r_m, false).await;
                                                     if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
                                                 }
                                             });
@@ -678,7 +875,9 @@ impl Squadron {
                                     if exit_pair {
                                         let other_tid = if tid == target_yes_token { target_no_token.clone() } else { target_yes_token.clone() };
                                         let other_tid_m = other_tid.clone(); // neutral key (slice 2a)
-                                        let pk = (sn.clone(), other_tid_m.clone()); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
+                                        let pk = (sn.clone(), other_tid_m.clone());
+                                        // Paired leg keys off its OWN opened-under mode (D1).
+                                        let (ps, paired_ghost) = { let map = positions.lock().await; match map.get(&pk) { Some(p) => (Some(p.shares), p.ghost), None => (None, false) } };
                                         if let Some(s) = ps {
                                             let exit_snap = if target_yes_token == ctx.market.yes_token {
                                                 &ctx.snapshot
@@ -686,15 +885,32 @@ impl Squadron {
                                                 ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot)
                                             };
                                             let other_bid = if other_tid == target_yes_token { exit_snap.yes_bid } else { exit_snap.no_bid };
+                                            let other_bid_depth = if other_tid == target_yes_token { exit_snap.yes_bid_depth } else { exit_snap.no_bid_depth };
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                                if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await; }
-                                                    let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
+                                                if !paired_ghost { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await; }
+                                                    let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) {
+                                                        let live_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                        let actual_other_exit = if paired_ghost {
+                                                            crate::helpers::paper::simulate_taker_sell_avg(
+                                                                live_other_exit, other_bid_depth, p.shares,
+                                                                config::PAPER_OVERFLOW_SLIPPAGE, config::MIN_SELL_LIMIT_PRICE,
+                                                            )
+                                                        } else {
+                                                            live_other_exit
+                                                        };
+                                                        let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl;
+                                                        if paired_ghost {
+                                                            *paper_pnl.lock().await += pnl;
+                                                            *paper_balance.lock().await += actual_other_exit * p.shares;
+                                                        } else {
+                                                            *total_pnl.lock().await += pnl;
+                                                        }
                                                 // Release paired token claim.
                                                 token_ownership.lock().await.remove(&other_tid_m);
                                                 {
                                                     let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl; let asset_t = asset_lc.clone();
-                                                    tokio::spawn(async move { metrics::record_trade(&asset_t, sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
+                                                    tokio::spawn(async move { metrics::record_trade(&asset_t, sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string(), paired_ghost).await; });
                                                 }
                                                 {
                                                     let sn_cp = sn.clone(); let tid_cp = other_tid.to_string(); let asset_c = asset_lc.clone();
@@ -713,8 +929,10 @@ impl Squadron {
                                     }
                                     if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
                                     last_trade_time.insert(sn.clone(), Instant::now());
-                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("🔴 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
-                                    { let session_pnl = *total_pnl.lock().await; tweet_trade(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), params.market_name.clone(), re_m, params.price, reason.clone(), pnl_m + paired_pnl, session_pnl); }
+                                    // D8: notifications keep firing for ghost exits but are labeled 👻 [PAPER]
+                                    // and report the paper session P&L; live notifications are unchanged.
+                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let session_pnl = if pos_ghost { *paper_pnl.lock().await } else { *total_pnl.lock().await }; let prefix = if pos_ghost { "👻 [PAPER] " } else { "" }; let msg = format!("{}🔴 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", prefix, sn, params.market_name, params.price, reason, session_pnl); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
+                                    { let session_pnl = if pos_ghost { *paper_pnl.lock().await } else { *total_pnl.lock().await }; let tweet_market = if pos_ghost { format!("👻 [PAPER] {}", params.market_name) } else { params.market_name.clone() }; tweet_trade(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), tweet_market, re_m, params.price, reason.clone(), pnl_m + paired_pnl, session_pnl); }
                                 }
                             }
 
@@ -830,29 +1048,66 @@ impl Squadron {
                                     if let Some(expiry) = pending.get(&pos_key) { if expiry > &Instant::now() { continue; } }
                                 }
 
-                                    if config::GHOST_MODE {
-                                    if positions.lock().await.contains_key(&pos_key) { continue; }
+                                    if params.ghost_mode {
+                                    {
+                                        // Guard BOTH legs: never overwrite an existing position
+                                        // (live OR ghost) for the primary or the paired token. A
+                                        // LIVE→GHOST toggle can leave a live pair leg in the map;
+                                        // unconditionally re-inserting the paired ghost leg (below)
+                                        // would silently convert that real exposure into paper.
+                                        let map = positions.lock().await;
+                                        if map.contains_key(&pos_key) { continue; }
+                                        if let Some(pp) = pair_params.as_ref() {
+                                            if map.contains_key(&(sn.clone(), pp.token_id.clone())) { continue; }
+                                        }
+                                    }
                                     let pos_close_time = target_market_close_time;
-                                    let actual_entry_price = if params.post_only { params.price } else { (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE) };
-                                    positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()) });
+                                    // D4: depth-aware simulated taker entry fill. Up to ask_depth shares fill at
+                                    // the offset ask (current price logic); the overflow tranche fills worse
+                                    // (+PAPER_OVERFLOW_SLIPPAGE, capped at MAX_BUY_LIMIT_PRICE). post_only quotes
+                                    // rest, so they keep the requested price with no overflow.
+                                    let primary_base = if params.post_only { params.price } else { (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE) };
+                                    let primary_ask_depth = if params.token_id == target_yes_token { entry_snap.yes_ask_depth } else { entry_snap.no_ask_depth };
+                                    let actual_entry_price = if params.post_only { primary_base } else {
+                                        crate::helpers::paper::simulate_taker_buy_avg(primary_base, primary_ask_depth, params.shares, config::PAPER_OVERFLOW_SLIPPAGE, config::MAX_BUY_LIMIT_PRICE)
+                                    };
+                                    // Paired leg fill price (if any) — computed up-front for the combined ledger check.
+                                    let paired_fill: Option<(Decimal, Decimal)> = pair_params.as_ref().map(|pp| {
+                                        let base = if pp.post_only { pp.price } else { (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE) };
+                                        let ask_depth = if pp.token_id == target_yes_token { entry_snap.yes_ask_depth } else { entry_snap.no_ask_depth };
+                                        let price = if pp.post_only { base } else {
+                                            crate::helpers::paper::simulate_taker_buy_avg(base, ask_depth, pp.shares, config::PAPER_OVERFLOW_SLIPPAGE, config::MAX_BUY_LIMIT_PRICE)
+                                        };
+                                        (price, pp.shares)
+                                    });
+                                    // D7: debit the paper collateral ledger; reject (warn + skip, no panic) when
+                                    // the ledger cannot cover the (combined) simulated cost.
+                                    let total_cost = actual_entry_price * params.shares
+                                        + paired_fill.map(|(pr, sh)| pr * sh).unwrap_or(dec!(0));
+                                    {
+                                        let mut bal = paper_balance.lock().await;
+                                        if *bal < total_cost {
+                                            warn!("👻 [PAPER] ENTRY REJECTED [{}]: {} | cost ${:.4} exceeds paper balance ${:.4} — skipping (simulated)", sn, params.market_name, total_cost, *bal);
+                                            last_trade_time.insert(sn.clone(), Instant::now());
+                                            continue;
+                                        }
+                                        *bal -= total_cost;
+                                    }
+                                    positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()), ghost: true });
                                     token_ownership.lock().await.insert(token_m.clone(), sn.clone());
                                     let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
-                                    info!("👻 GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)", side_g, sn, params.market_name, params.price, params.shares);
-                                    { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; }); }
+                                    info!("👻 [PAPER] ENTRY {} [{}]: {} | ${:.4} x {:.1} @ fill ${:.4} (simulated)", side_g, sn, params.market_name, params.price, params.shares, actual_entry_price);
+                                    { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g, true).await; }); }
                                     { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let snap_g = entry_snap.clone(); tokio::spawn(async move { metrics::record_entry_signal(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g, &snap_g).await; }); }
                                     if let Some(pool) = db::pool_for(&asset_lc) { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(&pool, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
-                                        let actual_paired_entry_price = if pp.post_only {
-                                            pp.price
-                                        } else {
-                                            (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
-                                        };
-                                        positions.lock().await.insert((sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()) });
+                                        let actual_paired_entry_price = paired_fill.map(|(pr, _)| pr).unwrap_or(pp.price);
+                                        positions.lock().await.insert((sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()), ghost: true });
                                         token_ownership.lock().await.insert(pp.token_id.clone(), sn.clone());
                                         let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
-                                        info!("👻 GHOST_MODE ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares);
-                                        { let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares; let asset_gp = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_gp, sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp).await; }); }
+                                        info!("👻 [PAPER] ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} @ fill ${:.4} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares, actual_paired_entry_price);
+                                        { let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares; let asset_gp = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_gp, sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp, true).await; }); }
                                         if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(&pool, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
@@ -861,7 +1116,7 @@ impl Squadron {
                                     {
                                         let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
                                         let pos_close_time = target_market_close_time;
-                                        map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()) });
+                                        map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()), ghost: false });
                                     }
                                     // Claim token in ownership registry immediately — prevents any
                                     // concurrent strategy tick from racing into the same token
@@ -942,12 +1197,12 @@ impl Squadron {
                                                         if let Some(pool) = db::pool_for(&asset_a) {
                                                             db::confirm_position_status(&pool, &db_sn_a, &db_tid_a).await;
                                                         }
-                                                        metrics::record_entry(&asset_a, db_sn_a, db_tid_a, db_mn_a, db_side_a.to_string(), db_ep_a, db_sh_a).await;
+                                                        metrics::record_entry(&asset_a, db_sn_a, db_tid_a, db_mn_a, db_side_a.to_string(), db_ep_a, db_sh_a, false).await;
                                                     }
                                                 });
 
                                         let pp_close_time = target_market_close_time;
-                                        positions.lock().await.insert((sn.clone(), pp_token_m.clone()), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: Some(token_m.clone()) });
+                                        positions.lock().await.insert((sn.clone(), pp_token_m.clone()), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: Some(token_m.clone()), ghost: false });
                                         // Claim paired token in registry.
                                         token_ownership.lock().await.insert(pp_token_m.clone(), sn.clone());
 
@@ -965,7 +1220,7 @@ impl Squadron {
                                                         if let Some(pool) = db::pool_for(&asset_b) {
                                                             db::confirm_position_status(&pool, &db_sn_b, &db_tid_b).await;
                                                         }
-                                                        metrics::record_entry(&asset_b, db_sn_b, db_tid_b, db_mn_b, db_side_b.to_string(), db_ep_b, db_sh_b).await;
+                                                        metrics::record_entry(&asset_b, db_sn_b, db_tid_b, db_mn_b, db_side_b.to_string(), db_ep_b, db_sh_b, false).await;
                                                     }
                                                 });
 
@@ -1048,7 +1303,7 @@ impl Squadron {
                                                 if let Some(pool) = db::pool_for(&asset_s) {
                                                     db::confirm_position_status(&pool, &db_sn_s, &db_tid_s).await;
                                                 }
-                                                metrics::record_entry(&asset_s, db_sn_s.clone(), db_tid_s.clone(), db_mn_s.clone(), db_side_s.to_string(), db_ep_s, db_sh_s).await;
+                                                metrics::record_entry(&asset_s, db_sn_s.clone(), db_tid_s.clone(), db_mn_s.clone(), db_side_s.to_string(), db_ep_s, db_sh_s, false).await;
                                                 metrics::record_entry_signal(&asset_s, db_sn_s, db_tid_s, db_mn_s, db_side_s.to_string(), db_ep_s, db_sh_s, &feat_snap_s).await;
                                             }
                                         });
@@ -1065,15 +1320,33 @@ impl Squadron {
                                     let p_token_m = p.token_id.clone(); // neutral key (slice 2a)
                                     let pk = (sn.clone(), p_token_m.clone());
                                     { let pending = pending_orders.lock().await; if let Some(expiry) = pending.get(&pk) { if expiry > &Instant::now() { continue; } } }
-                                    if config::GHOST_MODE {
+                                    if p.ghost_mode {
+                                        // D5: register a RESTING quote instead of an instant fill. It fills on a
+                                        // later tick once the market's best bid has sat at/below it long enough.
                                         if positions.lock().await.contains_key(&pk) { continue; }
-                                        positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
-                                        info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
+                                        let side_q = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
+                                        // A quote for the same (strategy, token) supersedes the previous one,
+                                        // but re-emitting the SAME price every qualifying tick must NOT reset
+                                        // the simulated queue position — otherwise the counter is pinned at 0/1
+                                        // and the quote can never rest PAPER_MAKER_FILL_TICKS ticks. Only a
+                                        // genuine price change re-joins the back of the queue (resets to 0).
+                                        let prev_ticks = ghost_maker_quotes.get(&pk)
+                                            .filter(|q| q.price == p.price)
+                                            .map(|q| q.consecutive_ticks)
+                                            .unwrap_or(0);
+                                        ghost_maker_quotes.insert(pk.clone(), GhostRestingQuote {
+                                            price: p.price,
+                                            shares: p.shares,
+                                            market_name: p.market_name.clone(),
+                                            side: side_q,
+                                            consecutive_ticks: prev_ticks,
+                                        });
+                                        info!("👻 [PAPER] MakerQuote resting [{}]: {} | shares={:.2}, bid=${:.4} (simulated queue)", sn, p.market_name, p.shares, p.price);
                                         placed = true;
                                     } else {
                                         if !positions.lock().await.contains_key(&pk) {
                                             info!("📝 MakerQuote [{}]: {} | shares={:.2}, bid=${:.4}", sn, p.market_name, p.shares, p.price);
-                                            positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: None });
+                                            positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: None, ghost: false });
                                             token_ownership.lock().await.insert(p_token_m.clone(), sn.clone());
                                             { pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3)); }
                                             let _ = tokio::time::timeout(Duration::from_secs(10), crate::helpers::balance::quick_confirm_fill(&trading_client, &sn, &p.token_id, &positions, &p.condition_id, p.order_type.clone())).await;
@@ -1099,7 +1372,7 @@ impl Squadron {
                                                     if let Some(pool) = db::pool_for(&asset_em) {
                                                         db::confirm_position_status(&pool, &sn_m, &tid_em).await;
                                                     }
-                                                    metrics::record_entry(&asset_em, sn_m, tid_em, mn_em, side_em, ep_em, sh_em).await;
+                                                    metrics::record_entry(&asset_em, sn_m, tid_em, mn_em, side_em, ep_em, sh_em, false).await;
                                                 }
                                             });
                                         }
@@ -1116,6 +1389,73 @@ impl Squadron {
                     }).await;
                     if signal_processing_result.is_err() {
                         warn!("⚠️ Signal processing timed out (45s) — select! loop unblocked, watchdog/heartbeat resume");
+                    }
+
+                    // ── D5: advance & fill simulated resting ghost maker quotes ──────────
+                    // Runs every tick (independent of the signal-processing timeout above)
+                    // so resting quotes accrue queue time even on ticks that produced no
+                    // new signals. A quote fills once its best bid has been ≤ the quote
+                    // price for PAPER_MAKER_FILL_TICKS consecutive ticks.
+                    if !ghost_maker_quotes.is_empty() {
+                        // Map a token id to its current market best bid from this tick's raw feeds.
+                        let bid_for = |tok: &MarketId| -> Decimal {
+                            if *tok == hourly_yes_token { hourly_yb }
+                            else if *tok == hourly_no_token { hourly_nb }
+                            else if maker_market_config.as_ref().is_some_and(|mk| mk.yes_token == *tok) { maker_yb }
+                            else if maker_market_config.as_ref().is_some_and(|mk| mk.no_token == *tok) { maker_nb }
+                            else { dec!(0) }
+                        };
+                        let mut fills: Vec<((String, MarketId), GhostRestingQuote)> = Vec::new();
+                        ghost_maker_quotes.retain(|(qsn, qtok), q| {
+                            let best_bid = bid_for(qtok);
+                            q.consecutive_ticks = crate::helpers::paper::maker_next_tick_count(q.consecutive_ticks, best_bid, q.price);
+                            if crate::helpers::paper::maker_should_fill(q.consecutive_ticks, config::PAPER_MAKER_FILL_TICKS) {
+                                fills.push(((qsn.clone(), qtok.clone()), q.clone()));
+                                false // filled — drop from the resting registry
+                            } else {
+                                true
+                            }
+                        });
+                        for ((qsn, qtok), q) in fills {
+                            // Skip if a position already exists for this (strategy, token).
+                            if positions.lock().await.contains_key(&(qsn.clone(), qtok.clone())) { continue; }
+                            // Sovereignty: never fill a ghost quote onto a token another strategy
+                            // already owns or holds. A resting ghost quote claims no ownership, so a
+                            // live strategy can open a real position on the same token in the interim;
+                            // filling here would commingle a paper position with a live on-chain balance
+                            // and corrupt that strategy's live exit reconciliation (2026-06-27 Basis loss).
+                            {
+                                let owned_by_other = token_ownership.lock().await
+                                    .get(&qtok).map(|o| o != &qsn).unwrap_or(false);
+                                let held_by_other = positions.lock().await.iter()
+                                    .any(|((s, t), _)| *t == qtok && s != &qsn);
+                                if owned_by_other || held_by_other {
+                                    warn!("👻 [PAPER] MakerQuote fill SKIPPED [{}]: token {} owned/held by another strategy (simulated)", qsn, qtok);
+                                    continue;
+                                }
+                            }
+                            // D7 ledger debit — reject the simulated fill if the paper ledger can't cover it.
+                            let cost = q.price * q.shares;
+                            {
+                                let mut bal = paper_balance.lock().await;
+                                if *bal < cost {
+                                    warn!("👻 [PAPER] MakerQuote fill REJECTED [{}]: {} | cost ${:.4} exceeds paper balance ${:.4} (simulated)", qsn, q.market_name, cost, *bal);
+                                    continue;
+                                }
+                                *bal -= cost;
+                            }
+                            positions.lock().await.insert((qsn.clone(), qtok.clone()), Position { shares: q.shares, avg_entry: q.price, opened_at: Utc::now(), close_time: None, market_name: q.market_name.clone(), pair_token_id: qtok.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, ghost: true });
+                            token_ownership.lock().await.insert(qtok.clone(), qsn.clone());
+                            info!("👻 [PAPER] MakerQuote FILLED [{}]: {} | {:.2} shares @ ${:.4} after {} ticks (simulated)", qsn, q.market_name, q.shares, q.price, q.consecutive_ticks);
+                            // Same DB rows a live maker fill writes (entries + open_positions), ghost-flagged.
+                            if let Some(pool) = db::pool_for(&asset_lc) {
+                                db::record_open_position(&pool, &qsn, &qtok.to_string(), &q.market_name, &q.side, q.price, q.shares, true).await;
+                            }
+                            let asset_g = asset_lc.clone(); let tid_g = qtok.to_string(); let mn_g = q.market_name.clone(); let side_g = q.side.clone(); let ep_g = q.price; let sh_g = q.shares;
+                            tokio::spawn(async move {
+                                metrics::record_entry(&asset_g, qsn, tid_g, mn_g, side_g, ep_g, sh_g, true).await;
+                            });
+                        }
                     }
                 }
             }

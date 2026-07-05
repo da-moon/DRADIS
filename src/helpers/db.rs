@@ -146,7 +146,8 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             exit_price  TEXT    NOT NULL,
             shares      TEXT    NOT NULL,
             pnl         TEXT    NOT NULL,
-            reason      TEXT    NOT NULL
+            reason      TEXT    NOT NULL,
+            ghost_mode  INTEGER NOT NULL DEFAULT 0
         )"
     ).execute(pool).await?;
 
@@ -161,7 +162,8 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             side        TEXT    NOT NULL,
             entry_price TEXT    NOT NULL,
             shares      TEXT    NOT NULL,
-            session_id  TEXT    NOT NULL DEFAULT ''
+            session_id  TEXT    NOT NULL DEFAULT '',
+            ghost_mode  INTEGER NOT NULL DEFAULT 0
         )"
     ).execute(pool).await?;
 
@@ -520,6 +522,14 @@ async fn run_migrations(pool: &SqlitePool) {
     let _ = sqlx::query("ALTER TABLE entries ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
         .execute(pool).await;
 
+    // Add ghost_mode to trades and entries so simulated (paper) fills are
+    // distinguishable from live ones at the row level — mirrors the existing
+    // open_positions.ghost_mode column. DEFAULT 0 (live) for all pre-existing rows.
+    let _ = sqlx::query("ALTER TABLE trades ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0")
+        .execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE entries ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0")
+        .execute(pool).await;
+
     // Index for fast session-scoped queries
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_session ON trades(session_id)")
         .execute(pool).await;
@@ -611,6 +621,7 @@ pub async fn close_session() {
 
 // ─── Trade / Entry writes ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_trade_db(
     pool: &SqlitePool,
     strategy: &str,
@@ -622,12 +633,13 @@ pub async fn record_trade_db(
     pnl: Decimal,
     reason: &str,
     timestamp: Option<DateTime<Utc>>,
+    ghost: bool,
 ) {
     let ts = timestamp.unwrap_or_else(|| Utc::now()).to_rfc3339();
     let sid = current_session_id();
     if let Err(e) = sqlx::query(
-        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, ghost_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -639,6 +651,7 @@ pub async fn record_trade_db(
     .bind(pnl.to_string())
     .bind(reason)
     .bind(sid)
+    .bind(ghost as i32)
     .execute(pool)
     .await {
         error!("❌ DB trade write failed: {}", e);
@@ -708,6 +721,7 @@ pub async fn record_settlement_trade_idempotent(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_entry_db(
     pool: &SqlitePool,
     strategy: &str,
@@ -716,12 +730,13 @@ pub async fn record_entry_db(
     side: &str,
     entry_price: Decimal,
     shares: Decimal,
+    ghost: bool,
 ) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
     if let Err(e) = sqlx::query(
-        "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares, session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares, session_id, ghost_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -731,6 +746,7 @@ pub async fn record_entry_db(
     .bind(entry_price.to_string())
     .bind(shares.to_string())
     .bind(sid)
+    .bind(ghost as i32)
     .execute(pool)
     .await {
         error!("❌ DB entry write failed: {}", e);
@@ -1199,6 +1215,8 @@ struct StaticConfigSnapshot<'a> {
     enable_llm_advisor:                bool,
     llm_advisor_interval_secs:         u64,
     llm_advisor_trades_lookback:       i64,
+    llm_provider:                      &'a str,
+    llm_model:                         &'a str,
     llm_ollama_url:                    &'a str,
     llm_ollama_model:                  &'a str,
 }
@@ -1273,6 +1291,8 @@ pub async fn record_static_config_snapshot(pool: &SqlitePool) {
         enable_llm_advisor:                config::ENABLE_LLM_ADVISOR,
         llm_advisor_interval_secs:         config::LLM_ADVISOR_INTERVAL_SECS,
         llm_advisor_trades_lookback:       config::LLM_ADVISOR_TRADES_LOOKBACK,
+        llm_provider:                      config::LLM_PROVIDER,
+        llm_model:                         config::LLM_MODEL,
         llm_ollama_url:                    config::LLM_OLLAMA_URL,
         llm_ollama_model:                  config::LLM_OLLAMA_MODEL,
     };
@@ -1439,8 +1459,8 @@ pub async fn purge_stale_open_positions(
     // by its phantom mark-to-market (observed: +$14.85 of redeemed ETH arb legs).
     const STALE_PENDING_GRACE_SECS: i64 = 3600; // 60 min ≫ indexer lag, ≪ orphan lifetime
 
-    let rows: Vec<(i64, String, Option<String>, String)> = match sqlx::query_as(
-        "SELECT id, token_id, status, ts FROM open_positions"
+    let rows: Vec<(i64, String, Option<String>, String, i64)> = match sqlx::query_as(
+        "SELECT id, token_id, status, ts, ghost_mode FROM open_positions"
     )
     .fetch_all(pool)
     .await {
@@ -1450,7 +1470,16 @@ pub async fn purge_stale_open_positions(
 
     let now = Utc::now();
     let mut purged = 0usize;
-    for (id, token_id, status, ts) in rows {
+    for (id, token_id, status, ts, ghost_mode) in rows {
+        // GHOST (paper) rows never exist on-chain, so the live-token set never contains
+        // them — chain-sync must NOT purge them (mirrors purge_all_live_open_positions,
+        // which deletes only ghost_mode = 0). They are closed explicitly by the ghost
+        // exit / orphan-close / expiry-settlement paths. Without this exemption every
+        // ghost open_positions row would vanish within one 300s cleanup tick, defeating
+        // the paper-trading DB/UI parity goal.
+        if ghost_mode != 0 {
+            continue;
+        }
         // Still held on-chain (size > 0, not redeemable) — keep.
         if live_token_ids.contains(&token_id) {
             continue;
@@ -1631,6 +1660,8 @@ pub struct TradeRow {
     pub shares: String,
     pub pnl: String,
     pub reason: String,
+    /// True when this trade closed a simulated (paper/ghost) position.
+    pub ghost_mode: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1719,7 +1750,7 @@ pub async fn recent_stop_loss_exists(
 /// Return the most recent `limit` completed trades, newest first.
 pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     match sqlx::query(
-        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, ghost_mode
          FROM trades ORDER BY ts DESC LIMIT ?"
     )
     .bind(limit)
@@ -1735,6 +1766,7 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
             shares:      r.try_get::<String, _>(6).ok()?,
             pnl:         r.try_get::<String, _>(7).ok()?,
             reason:      r.try_get::<String, _>(8).ok()?,
+            ghost_mode:  r.try_get::<i64, _>(9).ok()? != 0,
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
     }
@@ -1835,7 +1867,7 @@ pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> 
 pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
-        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, ghost_mode
          FROM trades WHERE session_id = ? ORDER BY ts DESC"
     )
     .bind(sid)
@@ -1851,6 +1883,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             shares:      r.try_get::<String, _>(6).ok()?,
             pnl:         r.try_get::<String, _>(7).ok()?,
             reason:      r.try_get::<String, _>(8).ok()?,
+            ghost_mode:  r.try_get::<i64, _>(9).ok()? != 0,
         })).collect(),
         Err(e) => { error!("❌ DB get_session_trades failed: {}", e); vec![] }
     }
@@ -1866,7 +1899,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
 pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
-        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, ghost_mode
          FROM trades
          WHERE (session_id IS NULL OR session_id != ?)
          ORDER BY ts DESC LIMIT ?"
@@ -1885,6 +1918,7 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
             shares:      r.try_get::<String, _>(6).ok()?,
             pnl:         r.try_get::<String, _>(7).ok()?,
             reason:      r.try_get::<String, _>(8).ok()?,
+            ghost_mode:  r.try_get::<i64, _>(9).ok()? != 0,
         })).collect(),
         Err(e) => { error!("❌ DB get_previous_session_trades failed: {}", e); vec![] }
     }

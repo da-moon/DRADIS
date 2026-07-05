@@ -35,6 +35,7 @@ use tracing::{debug, warn};
 
 use crate::config;
 use crate::api::server::AssetRaptorHealth;
+use crate::raptors::source;
 
 /// Normalised derivatives-market snapshot broadcast to every consuming Viper.
 ///
@@ -59,11 +60,7 @@ pub async fn run_derivatives_raptor(
     deriv_tx: watch::Sender<DerivativesSnapshot>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
-    let symbol = match crypto_filter.as_str() {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _     => "BTCUSDT",
-    };
+    let symbol = source::binance_symbol(&crypto_filter);
     // Open interest — primary host + regional mirror fallback.
     let oi_primary  = format!("https://fapi.binance.com/fapi/v1/openInterest?symbol={}", symbol);
     let oi_fallback = format!("https://fapi.binance.us/fapi/v1/openInterest?symbol={}", symbol);

@@ -11,9 +11,11 @@ pub mod orders;
 pub mod market;
 pub mod notifications;
 pub mod metrics;
+pub mod paper;
 pub mod config_helpers;
 pub mod db;
 pub mod dynamic_config;
+pub mod llm_client;
 pub mod llm_advisor;
 
 pub use price::*;

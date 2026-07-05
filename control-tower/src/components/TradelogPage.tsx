@@ -101,7 +101,7 @@ function assetToEntries(asset: string, trades: TradeRow[], positions: OpenPositi
       shares:     parseFloat(t.shares),
       pnl:        parseFloat(t.pnl),
       reason:     t.reason,
-      ghost:      false,
+      ghost:      t.ghost_mode,
       chainAdopted: false,
     });
   }
@@ -270,6 +270,8 @@ export default function TradelogPage({ availableAssets }: Props) {
   const [statusFilter,   setStatusFilter]   = useState<string>('all');
   const [strategyFilter, setStrategyFilter] = useState<string>('all');
   const [sideFilter,     setSideFilter]     = useState<string>('all');
+  // Live vs Paper (ghost) segmented control — filters rows on their ghost flag.
+  const [modeFilter,     setModeFilter]     = useState<'all' | 'live' | 'paper'>('all');
 
   // ── RTB state ───────────────────────────────────────────────────────────────
   const [rtbEntry,   setRtbEntry]   = useState<LogEntry | null>(null);
@@ -338,9 +340,11 @@ export default function TradelogPage({ availableAssets }: Props) {
       if (statusFilter   !== 'all' && e.status                       !== statusFilter)   return false;
       if (strategyFilter !== 'all' && shortStrategy(e.strategy)      !== strategyFilter) return false;
       if (sideFilter     !== 'all' && e.side.toUpperCase()           !== sideFilter)     return false;
+      if (modeFilter     === 'live'  && e.ghost)  return false;
+      if (modeFilter     === 'paper' && !e.ghost) return false;
       return true;
     });
-  }, [allEntries, assetFilter, statusFilter, strategyFilter, sideFilter]);
+  }, [allEntries, assetFilter, statusFilter, strategyFilter, sideFilter, modeFilter]);
 
   // ── RTB handler ──────────────────────────────────────────────────────────────
   const handleRtbConfirm = async () => {
@@ -413,6 +417,16 @@ export default function TradelogPage({ availableAssets }: Props) {
           <span className="text-xs text-gray-500 font-mono ml-4 mr-1">Side:</span>
           {['all', 'YES', 'NO'].map(s => (
             <FilterPill key={s} label={s === 'all' ? 'All' : s} active={sideFilter === s} onClick={() => setSideFilter(s)} />
+          ))}
+
+          {/* Mode — Live vs Paper (ghost) */}
+          <span className="text-xs text-gray-500 font-mono ml-4 mr-1">Mode:</span>
+          {([
+            { v: 'all',   label: 'All' },
+            { v: 'live',  label: '⚡ Live' },
+            { v: 'paper', label: '👻 Paper' },
+          ] as const).map(({ v, label }) => (
+            <FilterPill key={v} label={label} active={modeFilter === v} onClick={() => setModeFilter(v)} />
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">

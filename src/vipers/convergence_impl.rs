@@ -35,7 +35,6 @@ use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
-use chrono::Utc;
 use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -66,12 +65,15 @@ impl ConvergenceStrategyImpl {
         ctx.crypto_filter.eq_ignore_ascii_case("btc")
     }
 
-    fn record_exit(&self, token_id: &MarketId) {
+    fn record_exit(&self, token_id: &MarketId, mono_now: Instant) {
+        // Clock seam (W1): stamp cooldowns with the tick's monotonic now so the
+        // later `duration_since(mono_now)` comparison measures historical elapsed
+        // time under replay (behaviour-identical in production).
         if let Ok(mut map) = self.post_exit_cooldown.lock() {
-            map.insert(token_id.clone(), Instant::now());
+            map.insert(token_id.clone(), mono_now);
         }
         if let Ok(mut last) = self.last_exit_signal_at.lock() {
-            *last = Some(Instant::now());
+            *last = Some(mono_now);
         }
     }
 }
@@ -97,7 +99,7 @@ impl Strategy for ConvergenceStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
         // Market maturation — avoid the thin, noisy book at market open.
-        let secs_since_start = (Utc::now() - ctx.market_started_at).num_seconds();
+        let secs_since_start = (ctx.wall_now - ctx.market_started_at).num_seconds();
         if secs_since_start < config::CONVERGENCE_MARKET_WARMUP_SECS {
             return Ok(StrategySignal::NoSignal);
         }
@@ -210,7 +212,7 @@ impl Strategy for ConvergenceStrategyImpl {
         // ── Per-token cooldown ────────────────────────────────────────────────
         if let Ok(map) = self.post_exit_cooldown.lock() {
             if let Some(t) = map.get(&token_id) {
-                if t.elapsed().as_secs() < config::CONVERGENCE_POST_EXIT_COOLDOWN_SECS {
+                if ctx.mono_now.duration_since(*t).as_secs() < config::CONVERGENCE_POST_EXIT_COOLDOWN_SECS {
                     return Ok(StrategySignal::NoSignal);
                 }
             }
@@ -239,7 +241,7 @@ impl Strategy for ConvergenceStrategyImpl {
         // or our position larger than the resting depth on our future-exit bid.
         let intended_shares = size / ask;
         let exit_bid_depth = if want_bull { snap.yes_bid_depth } else { snap.no_bid_depth };
-        let secs_left = market.market_close_time.map(|ct| (ct - Utc::now()).num_seconds());
+        let secs_left = market.market_close_time.map(|ct| (ct - ctx.wall_now).num_seconds());
         if let Some(reason) = crate::vipers::entry_liquidity_gate(secs_left, intended_shares, exit_bid_depth) {
             debug!(" Convergence blocked: {}", reason);
             return Ok(StrategySignal::NoSignal);
@@ -286,7 +288,7 @@ impl Strategy for ConvergenceStrategyImpl {
         let soft_exit_cooldown_active = {
             let last = self.last_exit_signal_at.lock().unwrap();
             match *last {
-                Some(t) => t.elapsed().as_secs() < config::CONVERGENCE_EXIT_SIGNAL_COOLDOWN_SECS,
+                Some(t) => ctx.mono_now.duration_since(t).as_secs() < config::CONVERGENCE_EXIT_SIGNAL_COOLDOWN_SECS,
                 None => false,
             }
         };
@@ -324,7 +326,7 @@ impl Strategy for ConvergenceStrategyImpl {
                 if avg_entry <= dec!(0) { continue; }
 
                 let fee_bps = if is_yes { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 };
-                let secs_held = (Utc::now() - position.opened_at).num_seconds();
+                let secs_held = (ctx.wall_now - position.opened_at).num_seconds();
                 let profit_margin = (bid - avg_entry) / avg_entry;
 
                 let make_exit = |reason: String| PendingExit {
@@ -396,7 +398,7 @@ impl Strategy for ConvergenceStrategyImpl {
         };
 
         if let Some(p) = pending {
-            self.record_exit(&p.token_id);
+            self.record_exit(&p.token_id, ctx.mono_now);
             return Ok(StrategySignal::Exit {
                 params: OrderParams {
                     token_id:     p.token_id,

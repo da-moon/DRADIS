@@ -80,7 +80,7 @@ use std::collections::{VecDeque, HashMap}; // Added HashMap
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use perpetual::{Matrix, PerpetualBooster};
 use perpetual::objective::Objective;
 use perpetual::booster::config::BoosterIO;
@@ -575,17 +575,22 @@ impl GboostStrategyImpl {
     ///      sparse.  Label: yes_bid rises within GBOOST_LOOKAHEAD_TICKS ticks → 1.0.
     ///      This breaks the chicken-and-egg deadlock that prevents the model from ever
     ///      reaching the minimum sample count required to produce its first predictions.
-    fn maybe_retrain(&self) {
+    fn maybe_retrain(&self, now: Instant) {
         if self.is_training.load(Ordering::Relaxed) { return; }
 
         // ── Degenerate-retrain backoff ─────────────────────────────────────────
         // When consecutive retrains produce degenerate models the engine must not
         // spin at 10-second intervals burning CPU.  Backoff grows exponentially:
         // 1st degen → 20s, 2nd → 40s, 3rd → 80s, … capped at 300s (5 min).
+        //
+        // `now` is the caller's clock (`ctx.mono_now` — the W1 seam), so under backtest
+        // replay the backoff is measured in HISTORICAL time (advancing 60s per candle),
+        // not real seconds; in production `ctx.mono_now` is `Instant::now()` captured at
+        // snapshot build, so behavior is unchanged.
         {
             let guard = self.retrain_backoff_until.lock().unwrap();
             if let Some(until) = *guard {
-                if Instant::now() < until {
+                if now < until {
                     return;
                 }
             }
@@ -717,8 +722,11 @@ impl GboostStrategyImpl {
                         let mut count = consecutive_degenerate.lock().unwrap();
                         *count += 1;
                         let backoff_secs = (20u64 * 2u64.pow((*count).saturating_sub(1).min(4) as u32)).min(300);
+                        // Deadline is relative to the caller's clock captured at spawn time
+                        // (`now` = `ctx.mono_now`), so replay measures the backoff in
+                        // historical time; identical to real time in production.
                         *retrain_backoff_until.lock().unwrap() =
-                            Some(Instant::now() + std::time::Duration::from_secs(backoff_secs));
+                            Some(now + std::time::Duration::from_secs(backoff_secs));
                         tracing::warn!(
                             " GboostStrategy: retrain produced degenerate model ({} trees < min {}), keeping previous (backoff {}s, #{} consecutive)",
                             n, config::GBOOST_MIN_USABLE_TREES, backoff_secs, *count
@@ -868,9 +876,9 @@ impl GboostStrategyImpl {
     }
 
     /// Mark token as cooling down with the standard cooldown after a TP or SignalRev exit.
-    fn mark_post_exit_cooldown(&self, token_id: MarketId) {
+    fn mark_post_exit_cooldown(&self, token_id: MarketId, wall_now: DateTime<Utc>) {
         let mut guard = self.post_exit_cooldowns.lock().unwrap();
-        guard.insert(token_id, (Utc::now(), config::GBOOST_POST_EXIT_COOLDOWN_SECS));
+        guard.insert(token_id, (wall_now, config::GBOOST_POST_EXIT_COOLDOWN_SECS));
     }
 
     /// Mark token as cooling down with the **extended** cooldown after a stop-loss exit.
@@ -878,14 +886,14 @@ impl GboostStrategyImpl {
     /// An SL exit means the market moved adversely against the position — not just that the
     /// model changed direction.  Using a longer cooldown (GBOOST_SL_POST_EXIT_COOLDOWN_SECS)
     /// prevents re-entering the same adverse direction within 20 minutes of a loss.
-    fn mark_post_exit_cooldown_sl(&self, token_id: MarketId) {
+    fn mark_post_exit_cooldown_sl(&self, token_id: MarketId, wall_now: DateTime<Utc>) {
         let mut guard = self.post_exit_cooldowns.lock().unwrap();
-        guard.insert(token_id, (Utc::now(), config::GBOOST_SL_POST_EXIT_COOLDOWN_SECS));
+        guard.insert(token_id, (wall_now, config::GBOOST_SL_POST_EXIT_COOLDOWN_SECS));
     }
 
     /// Returns remaining cooldown seconds for this token, if still cooling down.
-    fn post_exit_cooldown_remaining_secs(&self, token_id: MarketId) -> Option<i64> {
-        let now = Utc::now();
+    fn post_exit_cooldown_remaining_secs(&self, token_id: MarketId, wall_now: DateTime<Utc>) -> Option<i64> {
+        let now = wall_now;
         let mut guard = self.post_exit_cooldowns.lock().unwrap();
         if let Some((ts, cooldown_secs)) = guard.get(&token_id).copied() {
             let elapsed = (now - ts).num_seconds();
@@ -1010,7 +1018,7 @@ impl Strategy for GboostStrategyImpl {
             ctx.snapshot.clone()
         };
         self.push_snapshot(training_snapshot);
-        self.maybe_retrain();
+        self.maybe_retrain(ctx.mono_now);
 
         let dc = &ctx.dynamic_config;
         if !dc.enable_gboost {
@@ -1021,7 +1029,7 @@ impl Strategy for GboostStrategyImpl {
         }
 
         // ── Gate: market must be mature enough for orderbook features to be stable ──
-        if (Utc::now() - ctx.market_started_at).num_seconds() < config::GBOOST_MIN_MARKET_AGE_SECS {
+        if (ctx.wall_now - ctx.market_started_at).num_seconds() < config::GBOOST_MIN_MARKET_AGE_SECS {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -1150,7 +1158,7 @@ impl Strategy for GboostStrategyImpl {
         // live book has moved adversely between WebSocket events.
         // 2026-05-07 T6 & T7: entry_hb_age_sec 16–35s; live snapshot OBI differed
         // from heartbeat OBI by > 0.50, causing adverse entries.
-        let target_snap_age = (chrono::Utc::now() - target_snapshot.timestamp).num_seconds();
+        let target_snap_age = (ctx.wall_now - target_snapshot.timestamp).num_seconds();
         if target_snap_age > config::GBOOST_MAX_SNAPSHOT_AGE_SECS {
             tracing::debug!(
                 " GBoost entry blocked: target snapshot too stale ({}s > max {}s)",
@@ -1160,7 +1168,7 @@ impl Strategy for GboostStrategyImpl {
         }
         // Also gate on hourly snapshot staleness when trading the daily market.
         if ctx.maker_snapshot.is_some() {
-            let hourly_snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
+            let hourly_snap_age = (ctx.wall_now - ctx.snapshot.timestamp).num_seconds();
             if hourly_snap_age > config::GBOOST_MAX_SNAPSHOT_AGE_SECS {
                 tracing::debug!(
                     " GBoost entry blocked: hourly snapshot too stale ({}s > max {}s)",
@@ -1171,7 +1179,7 @@ impl Strategy for GboostStrategyImpl {
         }
 
         if let Some(close_time) = target_market.market_close_time {
-            if (close_time - Utc::now()).num_seconds() < config::GBOOST_MIN_SECS_TO_EXPIRY {
+            if (close_time - ctx.wall_now).num_seconds() < config::GBOOST_MIN_SECS_TO_EXPIRY {
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -1198,9 +1206,9 @@ impl Strategy for GboostStrategyImpl {
         {
             let conviction = (p_yes_up - 0.5).abs() * 2.0; // 0.0 at coin-flip, 1.0 at certainty
             let mut last = self.last_pred_log_at.lock().unwrap();
-            let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
+            let due = last.map_or(true, |t| ctx.mono_now.duration_since(t).as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
             if due {
-                *last = Some(Instant::now());
+                *last = Some(ctx.mono_now);
                 tracing::info!(
                     " GboostStrategy: P(UP)={:.3} conviction={:.2} thr={:.2} {}",
                     p_yes_up, conviction, entry_thresh,
@@ -1217,9 +1225,9 @@ impl Strategy for GboostStrategyImpl {
             ($reason:expr) => {{
                 if entry_eligible {
                     let mut last = self.last_veto_log_at.lock().unwrap();
-                    let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
+                    let due = last.map_or(true, |t| ctx.mono_now.duration_since(t).as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
                     if due {
-                        *last = Some(Instant::now());
+                        *last = Some(ctx.mono_now);
                         tracing::info!(" GBoost eligible-but-VETOED [{}] | P(UP)={:.3}", $reason, p_yes_up);
                     }
                 }
@@ -1289,13 +1297,13 @@ impl Strategy for GboostStrategyImpl {
                 if oracle_price < threshold {
                     // Spot is below the buffer — start or continue the timer
                     if bss.is_none() {
-                        *bss = Some(Instant::now());
+                        *bss = Some(ctx.mono_now);
                         tracing::debug!(
                             " GBoost: BTC spot ${:.0} < strike(${:.0}) − buffer(${:.0}) = ${:.0} — starting below-strike timer",
                             oracle_price, strike, buffer, threshold
                         );
                     }
-                    let elapsed_secs = bss.unwrap().elapsed().as_secs() as i64;
+                    let elapsed_secs = ctx.mono_now.duration_since(bss.unwrap()).as_secs() as i64;
                     elapsed_secs >= config::GBOOST_BELOW_STRIKE_SUPPRESS_SECS
                 } else {
                     // Spot recovered above the buffer — reset the timer
@@ -1340,7 +1348,7 @@ impl Strategy for GboostStrategyImpl {
             {
                 let lock_map = self.market_hold_locks.lock().unwrap();
                 if let Some(&lock_since) = lock_map.get(&target_market.condition_id) {
-                    let elapsed = lock_since.elapsed().as_secs() as i64;
+                    let elapsed = ctx.mono_now.duration_since(lock_since).as_secs() as i64;
                     if elapsed < config::GBOOST_MIN_HOLDING_LOCK_SECS {
                         veto!("market hold lock active");
                     }
@@ -1354,7 +1362,7 @@ impl Strategy for GboostStrategyImpl {
             if self.pending_entries.lock().unwrap().contains_key(&target_market.yes_token.clone()) {
                 return Ok(StrategySignal::NoSignal);
             }
-            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token.clone()) {
+            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token.clone(), ctx.wall_now) {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
             let yes_obi = Self::side_obi(true, target_snapshot);
@@ -1437,7 +1445,7 @@ impl Strategy for GboostStrategyImpl {
             );
             // Record market-level hold lock to prevent rapid flip chop.
             self.market_hold_locks.lock().unwrap()
-                .insert(target_market.condition_id.clone(), Instant::now());
+                .insert(target_market.condition_id.clone(), ctx.mono_now);
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: target_market.yes_token.clone(),
@@ -1464,7 +1472,7 @@ impl Strategy for GboostStrategyImpl {
             {
                 let lock_map = self.market_hold_locks.lock().unwrap();
                 if let Some(&lock_since) = lock_map.get(&target_market.condition_id) {
-                    let elapsed = lock_since.elapsed().as_secs() as i64;
+                    let elapsed = ctx.mono_now.duration_since(lock_since).as_secs() as i64;
                     if elapsed < config::GBOOST_MIN_HOLDING_LOCK_SECS {
                         veto!("market hold lock active");
                     }
@@ -1474,7 +1482,7 @@ impl Strategy for GboostStrategyImpl {
             if self.pending_entries.lock().unwrap().contains_key(&target_market.no_token.clone()) {
                 return Ok(StrategySignal::NoSignal);
             }
-            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token.clone()) {
+            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token.clone(), ctx.wall_now) {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
             let no_obi = Self::side_obi(false, target_snapshot);
@@ -1547,7 +1555,7 @@ impl Strategy for GboostStrategyImpl {
             );
             // Record market-level hold lock to prevent rapid flip chop.
             self.market_hold_locks.lock().unwrap()
-                .insert(target_market.condition_id.clone(), Instant::now());
+                .insert(target_market.condition_id.clone(), ctx.mono_now);
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: target_market.no_token.clone(),
@@ -1598,7 +1606,7 @@ impl Strategy for GboostStrategyImpl {
                     ((bid - pos.avg_entry) / pos.avg_entry).to_f64().unwrap_or(0.0)
                 } else { 0.0 };
                 let secs_held = pos.fill_confirmed_at
-                    .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
+                    .map(|t| (ctx.wall_now - t).num_seconds()).unwrap_or(0);
 
                 let exit_params = || OrderParams {
                     token_id: target_market.yes_token.clone(),
@@ -1614,7 +1622,7 @@ impl Strategy for GboostStrategyImpl {
 
                 if profit_pct >= tp {
                     self.record_training_outcome_on_exit(target_market.yes_token.clone(), profit_pct > 0.0);
-                    self.mark_post_exit_cooldown(target_market.yes_token.clone());
+                    self.mark_post_exit_cooldown(target_market.yes_token.clone(), ctx.wall_now);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP YES: gain={:.2}%", profit_pct * 100.0),
@@ -1623,7 +1631,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.yes_token.clone(), profit_pct > 0.0);
-                    self.mark_post_exit_cooldown_sl(target_market.yes_token.clone());
+                    self.mark_post_exit_cooldown_sl(target_market.yes_token.clone(), ctx.wall_now);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL YES: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -1642,7 +1650,7 @@ impl Strategy for GboostStrategyImpl {
                         let half_sl = sl / 2.0;
                         if profit_pct >= config::GBOOST_SIGNAL_REV_MIN_PROFIT || profit_pct <= -half_sl {
                             self.record_training_outcome_on_exit(target_market.yes_token.clone(), profit_pct > 0.0);
-                            self.mark_post_exit_cooldown(target_market.yes_token.clone());
+                            self.mark_post_exit_cooldown(target_market.yes_token.clone(), ctx.wall_now);
                             return Ok(StrategySignal::Exit {
                                 params: exit_params(),
                                 reason: format!("GBoost SignalRev YES: P(UP)={:.3}", p),
@@ -1667,7 +1675,7 @@ impl Strategy for GboostStrategyImpl {
                     ((bid - pos.avg_entry) / pos.avg_entry).to_f64().unwrap_or(0.0)
                 } else { 0.0 };
                 let secs_held = pos.fill_confirmed_at
-                    .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
+                    .map(|t| (ctx.wall_now - t).num_seconds()).unwrap_or(0);
 
                 let exit_params = || OrderParams {
                     token_id: target_market.no_token.clone(),
@@ -1683,7 +1691,7 @@ impl Strategy for GboostStrategyImpl {
 
                 if profit_pct >= tp {
                     self.record_training_outcome_on_exit(target_market.no_token.clone(), profit_pct > 0.0);
-                    self.mark_post_exit_cooldown(target_market.no_token.clone());
+                    self.mark_post_exit_cooldown(target_market.no_token.clone(), ctx.wall_now);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP NO: gain={:.2}%", profit_pct * 100.0),
@@ -1692,7 +1700,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.no_token.clone(), profit_pct > 0.0);
-                    self.mark_post_exit_cooldown_sl(target_market.no_token.clone());
+                    self.mark_post_exit_cooldown_sl(target_market.no_token.clone(), ctx.wall_now);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL NO: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -1708,7 +1716,7 @@ impl Strategy for GboostStrategyImpl {
                         let half_sl = sl / 2.0;
                         if profit_pct >= config::GBOOST_SIGNAL_REV_MIN_PROFIT || profit_pct <= -half_sl {
                             self.record_training_outcome_on_exit(target_market.no_token.clone(), profit_pct > 0.0);
-                            self.mark_post_exit_cooldown(target_market.no_token.clone());
+                            self.mark_post_exit_cooldown(target_market.no_token.clone(), ctx.wall_now);
                             return Ok(StrategySignal::Exit {
                                 params: exit_params(),
                                 reason: format!("GBoost SignalRev NO: P(UP)={:.3}", p),
@@ -1784,6 +1792,9 @@ mod tests {
             maker_snapshot: None, // Added missing field
             dynamic_config: Arc::new(DynamicConfig::default()),
             arb_market_lockouts: None,
+            wall_now: Utc::now(),
+            mono_now: Instant::now(),
+            is_replay: false,
         }
     }
 
@@ -1871,6 +1882,7 @@ mod tests {
                     pair_token_id: ctx.market.yes_token.clone(),
                     fill_confirmed_at: Some(Utc::now()),
                     paired_leg_token_id: None,
+                    ghost: false,
                 },
             );
         }
@@ -1904,6 +1916,7 @@ mod tests {
                     pair_token_id: ctx.market.yes_token.clone(),
                     fill_confirmed_at: Some(Utc::now()),
                     paired_leg_token_id: None,
+                    ghost: false,
                 },
             );
         }

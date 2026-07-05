@@ -16,21 +16,23 @@
 ///     keepalive pings reset the 30s timer but ticker text has silently stopped
 ///
 /// Consumers should treat a `dec!(0)` oracle price as "not yet connected".
+///
+/// The velocity / acceleration / drift math lives in `kinematics::PriceKinematics`
+/// so the Hyperliquid raptor derives byte-identical signals from its trade feed.
 use std::str::FromStr;
 use std::collections::HashMap;
 
 use futures::StreamExt as _;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, timeout as tokio_timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{info, warn};
-use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::config;
 use crate::api::server::AssetRaptorHealth;
+use crate::raptors::kinematics::PriceKinematics;
+use crate::raptors::source;
 
 pub async fn run_price_raptor(
     crypto_filter: String,
@@ -41,16 +43,10 @@ pub async fn run_price_raptor(
     drift_tx: watch::Sender<(Decimal, Decimal)>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
-    let binance_pair = match crypto_filter.as_str() {
-        "eth" => "ethusdt",
-        "sol" => "solusdt",
-        _     => "btcusdt",
-    };
+    let binance_pair = source::binance_ws_pair(&crypto_filter);
     let url_str = format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair);
-    let mut price_history: VecDeque<(Instant, Decimal)> = VecDeque::new();
-    let mut price_history_60m: VecDeque<(Instant, Decimal)> = VecDeque::new();
-    let mut price_history_10m: VecDeque<(Instant, Decimal)> = VecDeque::new();
-    let mut prev_velocity = dec!(0);
+    // Rolling velocity/accel/drift accumulator — shared math with the HL raptor.
+    let mut kin = PriceKinematics::new();
 
     loop {
         if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
@@ -83,86 +79,22 @@ pub async fn run_price_raptor(
                                         let now = Instant::now();
                                         last_price_tick = now; // reset staleness clock
                                         let _ = oracle_tx.send(price);
-                                        price_history.push_back((now, price));
 
-                                        // Trim entries older than the primary window (5s)
-                                        while let Some((t, _)) = price_history.front() {
-                                            if now.duration_since(*t).as_secs() >= config::MOMENTUM_WINDOW_SECS {
-                                                price_history.pop_front();
-                                            } else { break; }
-                                        }
-
-                                        // Primary velocity (5s window)
-                                        let velocity_5s = if let Some((_, start_price)) = price_history.front() {
-                                            price - start_price
-                                        } else { dec!(0) };
-
-                                        // Short velocity (1s window)
-                                        let velocity_1s = {
-                                            let cutoff = config::MOMENTUM_SHORT_WINDOW_SECS;
-                                            let start_1s = price_history.iter()
-                                                .find(|(t, _)| now.duration_since(*t).as_secs() < cutoff);
-                                            match start_1s {
-                                                Some((_, p)) => price - p,
-                                                None => velocity_5s,
-                                            }
-                                        };
-
-                                        // Acceleration: rate of change of velocity
-                                        let acceleration = velocity_5s - prev_velocity;
-                                        prev_velocity = velocity_5s;
-                                        let _ = velocity_tx.send((velocity_5s, velocity_1s, acceleration));
-
-                                        // 60-minute drift
-                                        price_history_60m.push_back((now, price));
-                                        while let Some((t, _)) = price_history_60m.front() {
-                                            if now.duration_since(*t).as_secs() > 3600 {
-                                                price_history_60m.pop_front();
-                                            } else { break; }
-                                        }
-                                        let drift_60m = if price_history_60m.len() > 1 {
-                                            if let Some((oldest_t, oldest_p)) = price_history_60m.front() {
-                                                if now.duration_since(*oldest_t).as_secs() >= 3600 {
-                                                    price - oldest_p
-                                                } else { dec!(0) }
-                                            } else { dec!(0) }
-                                        } else { dec!(0) };
-
-                                        // 10-minute drift — fills the 5s–60m gap for GBoost feature [18].
-                                        // Captures the medium-term trend where profitable binary moves develop.
-                                        //
-                                        // Previously returned dec!(0) unless exactly 10 minutes of history
-                                        // were available.  Fixed: if at least 60 seconds of data exists,
-                                        // return the drift over whatever window IS available.  This ensures
-                                        // the momentum 10m-drift gate is active from the second minute
-                                        // rather than silent for the entire first 10 minutes of a session.
-                                        price_history_10m.push_back((now, price));
-                                        while let Some((t, _)) = price_history_10m.front() {
-                                            if now.duration_since(*t).as_secs() > 600 {
-                                                price_history_10m.pop_front();
-                                            } else { break; }
-                                        }
-                                        let drift_10m = if let Some((oldest_t, oldest_p)) = price_history_10m.front() {
-                                            let window_secs = now.duration_since(*oldest_t).as_secs();
-                                            // Require at least 60s of history before trusting the drift.
-                                            // Below that, the window is too short to distinguish noise from trend.
-                                            if window_secs >= 60 {
-                                                price - oldest_p
-                                            } else { dec!(0) }
-                                        } else { dec!(0) };
-
-                                        let _ = drift_tx.send((drift_60m, drift_10m));
+                                        // Derive velocity / acceleration / drift.
+                                        let sig = kin.on_price(now, price);
+                                        let _ = velocity_tx.send((sig.velocity_5s, sig.velocity_1s, sig.acceleration));
+                                        let _ = drift_tx.send((sig.drift_60m, sig.drift_10m));
 
                                         // Mirror the latest signal snapshot into the shared
                                         // raptor-health map so GET /api/telemetry can graph it.
                                         raptor_health_tx.send_modify(|map| {
                                             let h = map.entry(crypto_filter.clone()).or_default();
                                             h.oracle_price = price;
-                                            h.velocity_5s  = velocity_5s;
-                                            h.velocity_1s  = velocity_1s;
-                                            h.acceleration = acceleration;
-                                            h.drift_60m    = drift_60m;
-                                            h.drift_10m    = drift_10m;
+                                            h.velocity_5s  = sig.velocity_5s;
+                                            h.velocity_1s  = sig.velocity_1s;
+                                            h.acceleration = sig.acceleration;
+                                            h.drift_60m    = sig.drift_60m;
+                                            h.drift_10m    = sig.drift_10m;
                                         });
                                     }
                                 }
@@ -184,8 +116,7 @@ pub async fn run_price_raptor(
         raptor_health_tx.send_modify(|map| {
             map.entry(crypto_filter.clone()).or_default().price_connected = false;
         });
-        prev_velocity = dec!(0);
-        price_history_10m.clear();
+        kin.reset_velocity();
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

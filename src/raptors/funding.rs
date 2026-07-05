@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 
 use crate::config;
 use crate::api::server::AssetRaptorHealth;
+use crate::raptors::source;
 
 pub async fn run_funding_raptor(
     http: Arc<reqwest::Client>,
@@ -30,11 +31,7 @@ pub async fn run_funding_raptor(
     funding_tx: watch::Sender<Decimal>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
-    let symbol = match crypto_filter.as_str() {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _     => "BTCUSDT",
-    };
+    let symbol = source::binance_symbol(&crypto_filter);
     // Primary: Binance FAPI (futures). Fallback: Binance FAPI regional mirror.
     let url_primary  = format!("https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}", symbol);
     let url_fallback = format!("https://fapi.binance.us/fapi/v1/premiumIndex?symbol={}", symbol);

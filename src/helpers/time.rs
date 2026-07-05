@@ -5,6 +5,8 @@ use regex::Regex;
 use std::str::FromStr as _;
 use tracing::debug;
 
+use crate::raptors::source::{self, MarketDataSource};
+
 /// Fetch strike price from Binance using market close time as reference
 pub async fn fetch_strike_price_from_close_time(
     http: &reqwest::Client,
@@ -32,27 +34,35 @@ pub async fn fetch_strike_price_from_close_time(
 
     let utc_millis = reference_time.timestamp_millis();
 
-    let binance_symbol = match filter {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _ => "BTCUSDT",
-    };
+    // Fetch the reference-minute close from the configured market-data source.
+    match MarketDataSource::resolve() {
+        MarketDataSource::Binance => {
+            let binance_symbol = source::binance_symbol(filter);
 
-    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1", binance_symbol, utc_millis);
+            let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1", binance_symbol, utc_millis);
 
-    if let Ok(resp) = http.get(&url).send().await {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(candle) = json.as_array().and_then(|a| a.first()) {
-                if let Some(close_str) = candle.as_array().and_then(|a| a.get(4)).and_then(|v| v.as_str()) {
-                    if let Ok(price) = Decimal::from_str(close_str) {
-                        debug!("✅ Fetched strike price from Binance at market close time: ${}", price);
-                        return Some(price);
+            if let Ok(resp) = http.get(&url).send().await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(candle) = json.as_array().and_then(|a| a.first()) {
+                        if let Some(close_str) = candle.as_array().and_then(|a| a.get(4)).and_then(|v| v.as_str()) {
+                            if let Ok(price) = Decimal::from_str(close_str) {
+                                debug!("✅ Fetched strike price from Binance at market close time: ${}", price);
+                                return Some(price);
+                            }
+                        }
                     }
                 }
             }
+            None
+        }
+        MarketDataSource::Hyperliquid => {
+            if let Some(price) = fetch_hyperliquid_close(http, filter, utc_millis).await {
+                debug!("✅ Fetched strike price from Hyperliquid at market close time: ${}", price);
+                return Some(price);
+            }
+            None
         }
     }
-    None
 }
 
 /// Fetch historical strike price by parsing market description for date/time
@@ -106,24 +116,69 @@ pub async fn fetch_historical_strike_price(
     };
     let utc_millis = et_time.with_timezone(&Utc).timestamp_millis();
 
-    let binance_symbol = match filter {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _ => "BTCUSDT",
-    };
+    // Fetch the parsed-timestamp minute close from the configured source.
+    match MarketDataSource::resolve() {
+        MarketDataSource::Binance => {
+            let binance_symbol = source::binance_symbol(filter);
 
-    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1", binance_symbol, utc_millis);
+            let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1", binance_symbol, utc_millis);
 
-    if let Ok(resp) = http.get(&url).send().await {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(candle) = json.as_array().and_then(|a| a.first()) {
-                if let Some(close_str) = candle.as_array().and_then(|a| a.get(4)).and_then(|v| v.as_str()) {
-                    return Decimal::from_str(close_str).ok();
+            if let Ok(resp) = http.get(&url).send().await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(candle) = json.as_array().and_then(|a| a.first()) {
+                        if let Some(close_str) = candle.as_array().and_then(|a| a.get(4)).and_then(|v| v.as_str()) {
+                            return Decimal::from_str(close_str).ok();
+                        }
+                    }
                 }
             }
+            None
         }
+        MarketDataSource::Hyperliquid => fetch_hyperliquid_close(http, filter, utc_millis).await,
     }
-    None
+}
+
+/// Fetch a 1-minute candle close from Hyperliquid via a plain reqwest POST to
+/// the public Info API (`candleSnapshot`). No SDK dependency — this path stays
+/// feature-flag-free so strike-price resolution compiles without the
+/// `hyperliquid` cargo feature. Returns `None` on any error (same graceful
+/// degradation as the Binance kline fetch).
+async fn fetch_hyperliquid_close(
+    http: &reqwest::Client,
+    filter: &str,
+    start_ms: i64,
+) -> Option<Decimal> {
+    let coin = source::hyperliquid_coin(filter);
+    // One 1-minute candle: [startTime, startTime + 60s).
+    let end_ms = start_ms + 60_000;
+    let body = serde_json::json!({
+        "type": "candleSnapshot",
+        "req": {
+            "coin": coin,
+            "interval": "1m",
+            "startTime": start_ms,
+            "endTime": end_ms,
+        }
+    });
+
+    let resp = http
+        .post("https://api.hyperliquid.xyz/info")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    let json = resp.json::<serde_json::Value>().await.ok()?;
+    parse_hyperliquid_candle_close(&json)
+}
+
+/// Parse the first candle's close (`c`) out of a Hyperliquid `candleSnapshot`
+/// response. The response is an array of candle objects `{t,T,s,i,o,h,l,c,v,n}`
+/// where every OHLCV value is a decimal string. Split out so it can be unit
+/// tested without a network round-trip.
+fn parse_hyperliquid_candle_close(json: &serde_json::Value) -> Option<Decimal> {
+    let candle = json.as_array().and_then(|a| a.first())?;
+    let close_str = candle.get("c").and_then(|v| v.as_str())?;
+    Decimal::from_str(close_str).ok()
 }
 
 /// Generate candidate market names for hourly crypto events
@@ -219,6 +274,43 @@ pub fn generate_daily_market_names(crypto_filter: &str, current_time_utc: DateTi
         names.push(format!("{} Up or Down on {} {}", crypto_name_short, month_name, day));
     }
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hyperliquid_candle_close() {
+        // Shape mirrors a real candleSnapshot element (all values are strings).
+        let json = serde_json::json!([
+            {
+                "t": 1_700_000_000_000u64,
+                "T": 1_700_000_059_999u64,
+                "s": "BTC",
+                "i": "1m",
+                "o": "42010.0",
+                "h": "42100.5",
+                "l": "41990.0",
+                "c": "42055.5",
+                "v": "12.34",
+                "n": 87
+            }
+        ]);
+        assert_eq!(parse_hyperliquid_candle_close(&json), Some(Decimal::from_str("42055.5").unwrap()));
+    }
+
+    #[test]
+    fn empty_candle_array_returns_none() {
+        let json = serde_json::json!([]);
+        assert_eq!(parse_hyperliquid_candle_close(&json), None);
+    }
+
+    #[test]
+    fn missing_close_field_returns_none() {
+        let json = serde_json::json!([{ "t": 1u64, "o": "1.0" }]);
+        assert_eq!(parse_hyperliquid_candle_close(&json), None);
+    }
 }
 
 

@@ -15,7 +15,6 @@
 
 use async_trait::async_trait;
 use anyhow::Result;
-use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::time::Instant;
@@ -75,14 +74,14 @@ impl Strategy for MakerStrategyImpl {
 
 
         // ── Market maturation gate ────────────────────────────────────────────
-        let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
+        let secs_since_market_start = (ctx.wall_now - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Expiry gate ───────────────────────────────────────────────────────
         if let Some(close_time) = market.market_close_time {
-            if (close_time - Utc::now()).num_seconds() < config::MAKER_MIN_SECS_TO_EXPIRY {
+            if (close_time - ctx.wall_now).num_seconds() < config::MAKER_MIN_SECS_TO_EXPIRY {
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
@@ -111,7 +110,7 @@ impl Strategy for MakerStrategyImpl {
         // one-sidedly — classic "toxic flow" that fills maker bids at adverse prices.
         // Suppress the affected side so we don't post into an active sweep.
         let (taker_flow_blocks_yes, taker_flow_blocks_no) = {
-            let now_inst = Instant::now();
+            let now_inst = ctx.mono_now;
             let mut prev_guard = self.prev_depths.lock().await;
 
             let drain_flags = if let Some(ref p) = *prev_guard {
@@ -301,7 +300,7 @@ impl Strategy for MakerStrategyImpl {
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
 
         let secs_to_expiry = market.market_close_time
-            .map(|t| (t - Utc::now()).num_seconds())
+            .map(|t| (t - ctx.wall_now).num_seconds())
             .unwrap_or(9999);
 
         // Near-expiry forced exit to avoid binary resolution risk
@@ -395,7 +394,7 @@ impl Strategy for MakerStrategyImpl {
 
             let profit_pct = (bid - position.avg_entry) / position.avg_entry;
             let secs_since_fill = position.fill_confirmed_at
-                .map(|t| (Utc::now() - t).num_seconds())
+                .map(|t| (ctx.wall_now - t).num_seconds())
                 .unwrap_or(0);
 
             if position.fill_confirmed_at.is_some() && profit_pct >= dc.maker_target_profit_pct {

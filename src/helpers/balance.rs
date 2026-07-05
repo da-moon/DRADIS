@@ -342,6 +342,7 @@ pub async fn reconcile_orphaned_positions(
                 pair_token_id: market.clone(),
                 fill_confirmed_at: Some(Utc::now()),
                 paired_leg_token_id: None, // fixed up below
+                ghost: false, // reconciled from a real on-chain balance
             });
 
             let source = if logged_strategy.is_some() { "DB" } else {
@@ -589,6 +590,7 @@ pub async fn arb_pair_fill_monitor(
                     pair_token_id: missing_market.clone(),
                     fill_confirmed_at: Some(Utc::now()),
                     paired_leg_token_id: Some(filled_market.clone()),
+                    ghost: ref_pos.ghost,
                 });
             }
         }
@@ -685,6 +687,7 @@ pub async fn arb_pair_fill_monitor(
                             pair_token_id: missing_market.clone(),
                             fill_confirmed_at: Some(Utc::now()),
                             paired_leg_token_id: Some(filled_market.clone()),
+                            ghost: ref_pos.ghost,
                         });
                     }
                     drop(map);
@@ -787,6 +790,7 @@ pub async fn arb_pair_fill_monitor(
                 filled_shares,
                 realized,
                 "Orphan flatten (bid exit)".to_string(),
+                false,
             ).await;
         }
         Err(e) => {

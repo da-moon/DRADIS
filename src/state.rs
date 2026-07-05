@@ -60,6 +60,11 @@ pub struct Position {
     /// If Some, this position is part of a hedged pair. Used to detect orphaned positions
     /// when the paired leg fails to fill.
     pub paired_leg_token_id: Option<MarketId>,
+    /// True when this position was opened in paper (ghost) mode. Position-scoped and
+    /// permanent: exits, reconciliation, orphan sweeps, and expiry settlement all key
+    /// off this flag — NOT the current GHOST/LIVE toggle — so a mid-session flip
+    /// grandfathers open positions (they close out under the mode they opened in).
+    pub ghost: bool,
 }
 
 /// Compound key for the shared position map: (strategy_name, token_id).

@@ -6,7 +6,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   ReferenceLine, Brush,
 } from 'recharts';
-import { getTelemetryHistory } from '@/lib/api';
+import { getTelemetryHistory, getStatus } from '@/lib/api';
 import type { TelemetrySample } from '@/lib/types';
 
 const POLL_MS = 2000;            // server samples at 2s — match it while live
@@ -406,6 +406,15 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
     { refreshInterval: live ? POLL_MS : 0, revalidateOnFocus: false, keepPreviousData: true },
   );
 
+  // Active market-data source drives the signal-chart subtitles (Binance vs
+  // Hyperliquid). Absent field (older backend) → Binance labels.
+  const { data: status } = useSWR('status', getStatus, { refreshInterval: 30_000 });
+  const isHyperliquid = status?.market_data_source === 'hyperliquid';
+  const srcName = isHyperliquid ? 'Hyperliquid' : 'Binance';
+  const oracleSubtitle = isHyperliquid ? 'Hyperliquid trades — current mark' : 'Binance Spot WS — current mark';
+  const fundingSubtitle = `${srcName} perpetual — smart-money lean`;
+  const oiSubtitle = `${srcName} perp OI change — 10m regime pressure`;
+
   const rows = useMemo<Row[]>(() => (samples ?? []).map(toRow), [samples]);
 
   // When pausing, seed the scrub range to the full loaded window; clear on resume.
@@ -451,6 +460,22 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           <ConnPill label="Derivatives Raptor" live={!!lastSample?.deriv_connected} />
           {asset === 'btc' && (
             <ConnPill label="Tide Raptor" live={!!lastSample?.tide_connected} />
+          )}
+
+          {/* Market-data source + effective LLM advisor provider/model. */}
+          <span
+            className="text-[10px] font-mono bg-sky-500/10 text-sky-300 border border-sky-500/20 rounded px-1.5 py-0.5"
+            title="Active market-data source"
+          >
+            src · {srcName}
+          </span>
+          {status?.llm_provider && (
+            <span
+              className="text-[10px] font-mono bg-violet-500/10 text-violet-300 border border-violet-500/20 rounded px-1.5 py-0.5"
+              title="Effective LLM Advisor provider/model (resolved server-side; no key)"
+            >
+              🤖 {status.llm_provider}{status.llm_model ? ` · ${status.llm_model}` : ''}
+            </span>
           )}
 
           {/* Window selector */}
@@ -530,7 +555,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <SignalChart
           title="Oracle Price"
-          subtitle="Binance Spot WS — current mark"
+          subtitle={oracleSubtitle}
           data={viewRows}
           series={[{ key: 'oracle', label: 'price', color: '#10b981' }]}
           fmtY={v => `$${Math.round(v).toLocaleString('en-US')}`}
@@ -560,7 +585,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
         />
         <SignalChart
           title="Funding Rate"
-          subtitle="Binance perpetual — smart-money lean"
+          subtitle={fundingSubtitle}
           data={viewRows}
           zeroLine
           series={[{ key: 'funding', label: 'rate', color: '#14b8a6' }]}
@@ -568,7 +593,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
         />
         <SignalChart
           title="Open Interest Δ"
-          subtitle="Binance perp OI change — 10m regime pressure"
+          subtitle={oiSubtitle}
           data={viewRows}
           zeroLine
           series={[{ key: 'oiDelta', label: 'ΔOI', color: '#f97316' }]}

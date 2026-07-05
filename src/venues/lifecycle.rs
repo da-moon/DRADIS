@@ -211,7 +211,11 @@ impl OrderLifecycle {
                     let i_held          = held.get(t.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
                     let partner_held    = held.get(partner.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
                     let partner_resting = resting_tokens.contains(partner.as_str());
-                    if p.fill_confirmed_at.is_some() && i_held && !partner_held && !partner_resting {
+                    // GHOST (paper) positions must never drive a REAL on-chain flatten:
+                    // their `held` truth comes from the wallet's token-keyed balance, which
+                    // can be satisfied by unrelated real shares, so a ghost leg could sell
+                    // real tokens it never bought. Live legs (ghost = false) are unaffected.
+                    if !p.ghost && p.fill_confirmed_at.is_some() && i_held && !partner_held && !partner_resting {
                         Some((s.clone(), t.clone(), p.shares, p.market_name.clone(), p.avg_entry))
                     } else {
                         None

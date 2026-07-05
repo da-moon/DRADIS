@@ -69,7 +69,7 @@ impl Strategy for TimeDecayStrategyImpl {
         let (market, snap) = (&ctx.market, &ctx.snapshot);
 
         let seconds_to_expiry = match market.market_close_time {
-            Some(close_time) => (close_time - Utc::now()).num_seconds(),
+            Some(close_time) => (close_time - ctx.wall_now).num_seconds(),
             None => return Ok(StrategySignal::NoSignal),
         };
 
@@ -94,7 +94,7 @@ impl Strategy for TimeDecayStrategyImpl {
         // retains stale depth values — a book that appears neutral can actually be
         // adverse when the WebSocket hasn't fired recently.
         // 2026-05-07 T3: entered with entry_hb_age_sec=34, stale OBI slipped the gate.
-        let snapshot_age_secs = (Utc::now() - snap.timestamp).num_seconds();
+        let snapshot_age_secs = (ctx.wall_now - snap.timestamp).num_seconds();
         if snapshot_age_secs > config::TIME_DECAY_MAX_SNAPSHOT_AGE_SECS {
             tracing::debug!(
                 "🚫 TimeDecay entry blocked: snapshot too stale ({}s > max {}s)",
@@ -233,7 +233,7 @@ impl Strategy for TimeDecayStrategyImpl {
             };
 
             // ── Min-hold guard ────────────────────────────────────────────────
-            let hold_secs = (Utc::now() - yp.opened_at).num_seconds();
+            let hold_secs = (ctx.wall_now - yp.opened_at).num_seconds();
             if hold_secs < config::TIME_DECAY_MIN_HOLD_SECS {
                 tracing::debug!("⏳ TimeDecay SL suppressed: hold={}s < min={}s", hold_secs, config::TIME_DECAY_MIN_HOLD_SECS);
             } else {
@@ -257,7 +257,7 @@ impl Strategy for TimeDecayStrategyImpl {
 
             // ── Forced expiry exit ────────────────────────────────────────────
             if let Some(close_time) = market.market_close_time {
-                if (close_time - Utc::now()).num_seconds() < config::MARKET_EXPIRY_SAFETY_BUFFER_SECS as i64 {
+                if (close_time - ctx.wall_now).num_seconds() < config::MARKET_EXPIRY_SAFETY_BUFFER_SECS as i64 {
                     return Ok(StrategySignal::Exit {
                         params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: TimeInForce::Fak, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: "Time Decay Expiry".to_string(),
