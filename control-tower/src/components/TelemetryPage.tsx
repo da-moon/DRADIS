@@ -49,6 +49,23 @@ function fmtClock(ms: number): string {
   });
 }
 
+// Sports telemetry now spans days (de-duplicated ~2h polls), so a seconds-level
+// clock is ambiguous. Label these points with month/day + HH:MM instead.
+function fmtDayClock(ms: number): string {
+  return new Date(ms).toLocaleString('en-US', {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+// Render an ISO-8601 kickoff time as a compact local "Sat 8:10 PM" label.
+function fmtKickoff(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString('en-US', {
+    weekday: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+}
+
 // rust_decimal::Decimal serializes to JSON as a *string* ("64000.5"), so every
 // numeric signal arrives here as a string despite the TelemetrySample type. Coerce
 // at the boundary — otherwise chart/stat formatters call .toFixed() on a string and
@@ -81,8 +98,9 @@ function toRow(s: TelemetrySample): Row {
   };
 }
 
-// The Sports Raptor is venue-neutral and polls on its own (~5 min) cadence, so it
-// gets its own chart row type independent of the crypto asset samples.
+// The Sports Raptor is venue-neutral and polls on its own (~2h) cadence; its telemetry
+// is de-duplicated server-side, so it gets its own sparse, multi-day chart row type
+// independent of the crypto asset samples.
 interface SportsRow {
   t: number;
   time: string;
@@ -95,7 +113,7 @@ interface SportsRow {
 function toSportsRow(s: TelemetrySample): SportsRow {
   return {
     t: Number(s.t),
-    time: fmtClock(Number(s.t)),
+    time: fmtDayClock(Number(s.t)),
     consensus: num(s.sports_consensus_prob),
     drift: num(s.sports_line_drift),
     dispersion: num(s.sports_book_dispersion),
@@ -484,8 +502,9 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
   const oiSubtitle = `${srcName} perp OI change — 10m regime pressure`;
 
   // The Sports Raptor is venue-neutral and publishes under a fixed "sports" key,
-  // independent of the selected crypto asset. It polls on a ~5-min cadence, so fetch
-  // a generous fixed history (independent of the crypto window selector) to plot it.
+  // independent of the selected crypto asset. It polls every ~2h and its telemetry is
+  // de-duplicated server-side (one point per change/heartbeat), so a modest fixed
+  // request spans many days of readable movement regardless of the crypto window.
   const { data: sportsSamples } = useSWR(
     ['telemetry-history', 'sports', 288],
     () => getTelemetryHistory('sports', 288),
@@ -732,6 +751,47 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
               </span>
             </div>
           </div>
+
+          {/* Which event / outcome / books the numbers describe */}
+          {sportsLast?.sports_connected && sportsLast?.sports_event ? (
+            <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3">
+              <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                {sportsLast.sports_sport && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
+                    {sportsLast.sports_sport}
+                  </span>
+                )}
+                <span className="text-sm text-gray-200 font-medium">{sportsLast.sports_event}</span>
+                {sportsLast.sports_commence && (
+                  <span className="text-[11px] font-mono text-gray-500">
+                    · {fmtKickoff(sportsLast.sports_commence)}
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] text-gray-500 mt-1.5">
+                Consensus is the vig-free implied probability that{' '}
+                <span className="text-emerald-300 font-mono">
+                  {sportsLast.sports_reference || 'the reference outcome'}
+                </span>{' '}
+                wins — currently{' '}
+                <span className="text-gray-200 font-mono">
+                  {(num(sportsLast.sports_consensus_prob) * 100).toFixed(1)}%
+                </span>.
+              </p>
+              {sportsLast.sports_books && (
+                <p className="text-[10px] font-mono text-gray-600 mt-1">
+                  <span className="text-gray-500">{num(sportsLast.sports_num_books).toFixed(0)} books:</span>{' '}
+                  {sportsLast.sports_books}
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3 text-[11px] font-mono text-gray-600">
+              No priced event yet — the raptor tracks the nearest upcoming game with live odds
+              (polls every ~2h to stay inside the free-tier budget).
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <SignalChart<SportsRow>
               title="Consensus Probability"
