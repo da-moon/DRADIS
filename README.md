@@ -458,7 +458,7 @@ The stored recommendation is tagged `provider/model` (e.g. `anthropic/claude-3-5
 
 ## Backtesting (`backtest` feature)
 
-An offline harness that replays historical **Hyperliquid** 1-minute candles + funding
+An offline harness that replays historical market data (selectable provider: Hyperliquid or Binance FAPI)
 through the **real viper strategies** (the same `Strategy` objects the live bot runs),
 behind the clock seam so warmup / staleness / cooldown / hold-time gates evaluate
 against *historical* time at any replay speed. It is behind a **non-default** cargo
@@ -468,9 +468,13 @@ feature so normal builds/CI never pay its cost.
 # System deps (rs-backtester drags a plotting/font stack):
 sudo apt-get install -y libfontconfig1-dev pkg-config
 
-# Replay the last ~5h of BTC through every viper:
+# Replay the last ~5h of BTC through every viper (Hyperliquid data, default):
 cargo run --features backtest --bin backtest -- \
   --coin BTC --start now-6h --end now-1h
+
+# Same, but from Binance FAPI perp data (no ~5000-candle retention limit):
+cargo run --features backtest --bin backtest -- \
+  --coin BTC --start now-6h --end now-1h --source binance
 
 # Sweep a subset with a custom book model:
 cargo run --features backtest --bin backtest -- \
@@ -478,6 +482,19 @@ cargo run --features backtest --bin backtest -- \
   --strategies momentum,trendreversal --spread 0.02 --depth 500 --commission 0.0 \
   --out backtest_out --cache backtest_cache.sqlite
 ```
+
+### Historical Data Source
+
+By default, backtests pull from **Hyperliquid** (`--source hyperliquid`). Optionally, use `--source binance` to pull from **Binance FAPI** perpetual futures data instead:
+
+| Option | Provider | Notes |
+|--------|----------|-------|
+| `--source hyperliquid` (default) | Hyperliquid public info API | Native hourly funding; retains only the most recent ~5000 candles per interval (≈3.5 days at 1m) — older windows are unfetchable |
+| `--source binance` | Binance FAPI perps | Native per-8h funding; deep lookback (no ~5000-candle retention limit) |
+
+Both sources accept the same `--interval` values (`1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w`); anything else is rejected up front rather than silently mis-paginated. Candles and funding are cached per-source in the same SQLite file (`--cache`), so switching `--source` never contaminates the other source's rows; pre-existing caches are migrated in place (tagged `hyperliquid`) on first open.
+
+No API keys are involved: both providers' market-data endpoints are public and unauthenticated (Hyperliquid's info API has no auth field at all; Binance market data is rate-limited by IP, not key).
 
 Each run prints a per-strategy table (trades / win-rate / native PnL), the
 rs-backtester Sharpe/drawdown/win-rate, and a **fidelity-tier disclaimer**, and writes
@@ -493,8 +510,8 @@ rs-backtester Sharpe/drawdown/win-rate, and a **fidelity-tier disclaimer**, and 
 - **Tier A** — `drift_10m`/`drift_60m` gates and strike-distance gates are faithful.
 - **Tier B** — velocity gates: `velocity_5s`/`velocity_1s` come from 1m closes at 60s
   steps, so sub-5s windows are ~0 (velocity-gated logic is approximate). Funding is a
-  real historical series (HL hourly rate **×8**-normalized onto Binance's per-8h scale;
-  funding is a **signal only** — binary shares pay no carry).
+  real historical series (normalized onto Binance's canonical per-8h scale; funding is a
+  **signal only** — binary shares pay no carry).
 - **Tier C** — the 8 Polymarket book fields are a parametric binary-option model
   (`--spread`/`--depth`), **not** a real order book; OI/CVD and
   `institutional_pulse`/`tide_coherence` have no historical source (= 0), so

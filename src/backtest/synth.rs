@@ -5,9 +5,11 @@
 //!   one-minute samples). `velocity_5s`/`velocity_1s` fall to ~0 because the 5s/1s
 //!   windows never contain a second sample at 60s spacing — velocity-gated logic is
 //!   therefore **Tier B** (approximate), as documented.
-//! * **Funding** — the HL HOURLY funding rate is normalized ×8 onto Binance's per-8h
-//!   scale via [`normalize_funding_8h`] (mirrors `raptors::hyperliquid`), then fed to
-//!   `snapshot.funding_rate`. Funding is a signal input only — binary shares pay no carry.
+//! * **Funding** — the provider-native funding rate is rescaled onto Binance's per-8h
+//!   scale via [`normalize_funding`] (generalized from the HL-only ×8 rescale that
+//!   [`normalize_funding_8h`] still performs as a back-compat alias; mirrors
+//!   `raptors::hyperliquid`), then fed to `snapshot.funding_rate`. Funding is a signal
+//!   input only — binary shares pay no carry.
 //! * **Derivatives / tide** — `oi_delta_pct = cvd_ratio = institutional_pulse =
 //!   tide_coherence = 0`: no historical source. Convergence no-ops by design (Tier C).
 //! * **Polymarket book** — the 8 book fields come from [`book_model`], a pure,
@@ -27,12 +29,23 @@ use crate::state::MarketSnapshot;
 use super::clock::ReplayClock;
 use super::fetch::Candle;
 
-/// Normalize an HL HOURLY funding rate onto Binance's per-8h scale (×8), exactly as
+/// Normalize a provider-native funding rate onto Binance's canonical per-8h
+/// scale. `period_hours` is the provider's native cadence
+/// (`HistoricalSource::funding_period_hours`: Hyperliquid = 1, Binance = 8).
+pub fn normalize_funding(rate: Decimal, period_hours: u32) -> Decimal {
+    if period_hours == 8 {
+        return rate; // already at target scale — avoid needless 8/8 arithmetic
+    }
+    rate * Decimal::from(8u32) / Decimal::from(period_hours.max(1))
+}
+
+/// Back-compat alias (HL hourly ×8), exactly as
 /// `raptors::hyperliquid::normalize_funding_8h` does. Re-implemented here (that fn is
 /// private AND behind the `hyperliquid` cargo feature, which `backtest` does not
-/// require) with its own test so the two can be diffed for drift.
+/// require) — keeps every existing call site and the drift-check test vs
+/// `raptors::hyperliquid`'s private copy compiling as-is.
 pub fn normalize_funding_8h(hourly: Decimal) -> Decimal {
-    hourly * dec!(8)
+    normalize_funding(hourly, 1)
 }
 
 /// The 8 modeled Polymarket book fields for one tick.
@@ -158,14 +171,16 @@ impl SnapshotSynthesizer {
     }
 
     /// Produce the `MarketSnapshot` for the candle at `candle.ts_ms`, given the
-    /// active market's `close_time`/`strike` and the (raw hourly) funding rate.
+    /// active market's `close_time`/`strike` and the (raw, provider-native cadence)
+    /// funding rate.
     pub fn on_tick(
         &mut self,
         clock: &ReplayClock,
         candle: &Candle,
         market_close: DateTime<Utc>,
         strike: Option<Decimal>,
-        funding_hourly: Decimal,
+        funding_native: Decimal,
+        funding_period_hours: u32,
     ) -> MarketSnapshot {
         // Kinematics at 60s synthetic steps (drift faithful; velocity ~0 → Tier B).
         let k = self
@@ -201,7 +216,7 @@ impl SnapshotSynthesizer {
             velocity: k.velocity_5s,
             velocity_1s: k.velocity_1s,
             acceleration: k.acceleration,
-            funding_rate: normalize_funding_8h(funding_hourly),
+            funding_rate: normalize_funding(funding_native, funding_period_hours),
             // Tier C — no historical source; Convergence no-ops on these.
             institutional_pulse: dec!(0),
             tide_coherence: dec!(0),
@@ -225,6 +240,22 @@ mod tests {
         assert_eq!(normalize_funding_8h(dec!(0.0000125)), dec!(0.0001));
         assert_eq!(normalize_funding_8h(dec!(-0.0000125)), dec!(-0.0001));
         assert_eq!(normalize_funding_8h(dec!(0)), dec!(0));
+    }
+
+    #[test]
+    fn normalize_funding_identity_at_target_cadence() {
+        // period_hours == 8 is already the canonical scale — pass-through.
+        assert_eq!(normalize_funding(dec!(0.0001), 8), dec!(0.0001));
+        assert_eq!(normalize_funding(dec!(-0.0001), 8), dec!(-0.0001));
+        assert_eq!(normalize_funding(dec!(0), 8), dec!(0));
+    }
+
+    #[test]
+    fn normalize_funding_scales_hourly_rate_by_8() {
+        // period_hours == 1 (Hyperliquid) rescales onto the per-8h target.
+        assert_eq!(normalize_funding(dec!(0.0000125), 1), dec!(0.0001));
+        assert_eq!(normalize_funding(dec!(-0.0000125), 1), dec!(-0.0001));
+        assert_eq!(normalize_funding(dec!(0), 1), dec!(0));
     }
 
     #[test]

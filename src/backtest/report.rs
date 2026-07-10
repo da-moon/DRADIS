@@ -224,6 +224,7 @@ pub fn build_report_json(
 
     serde_json::json!({
         "coin": cfg.coin,
+        "source": cfg.source.as_str(),
         "interval": cfg.interval,
         "start_ms": cfg.start_ms,
         "end_ms": cfg.end_ms,
@@ -260,8 +261,8 @@ pub fn build_report_json(
 pub fn print_summary(cfg: &BacktestConfig, outcome: &BacktestOutcome, rs: &Option<RsMetrics>) {
     println!("\n════════════════════ DRADIS BACKTEST ════════════════════");
     println!(
-        " {} {}  |  {} ticks over {} synthetic hourly markets",
-        cfg.coin, cfg.interval, outcome.ticks, outcome.markets
+        " {} {}  [{}]  |  {} ticks over {} synthetic hourly markets",
+        cfg.coin, cfg.interval, cfg.source.as_str(), outcome.ticks, outcome.markets
     );
     println!(
         " spread=±{}  depth={}sh/side  commission={}",

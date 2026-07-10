@@ -38,13 +38,15 @@ use super::clock::ReplayClock;
 use super::fetch::{BacktestCache, Candle, FundingPoint};
 use super::ledger::{ClosedTrade, CloseKind, Ledger};
 use super::llm_score::{LlmScorer, ScoredEntry};
+use super::source::{build_source, SourceKind};
 use super::synth::SnapshotSynthesizer;
 
 const HOUR_MS: i64 = 3_600_000;
 
 /// Fully-resolved backtest parameters (from the CLI).
 pub struct BacktestConfig {
-    /// Hyperliquid coin symbol, e.g. "BTC".
+    /// DRADIS coin symbol, e.g. "BTC" — mapped to the provider's wire symbol by
+    /// the selected source.
     pub coin: String,
     /// Lowercase asset used for `ctx.crypto_filter` (BTC-only gates read this).
     pub crypto_filter: String,
@@ -61,6 +63,9 @@ pub struct BacktestConfig {
     pub cache_path: String,
     pub out_dir: String,
     pub sigma_window: usize,
+    /// Historical-data provider to replay from. Both providers hit public,
+    /// unauthenticated endpoints — no credentials involved.
+    pub source: SourceKind,
 }
 
 /// Everything `report` needs after a run.
@@ -109,7 +114,7 @@ fn configure_enables(dc: &mut DynamicConfig, sel: &Option<Vec<String>>) {
     dc.ghost_mode = true;
 }
 
-/// Latest funding rate at or before `ts_ms` (raw HL hourly rate; 0 if none yet).
+/// Latest funding rate at or before `ts_ms` (provider-native rate; 0 if none yet).
 fn funding_at(funding: &[FundingPoint], ts_ms: i64) -> Decimal {
     match funding.binary_search_by(|f| f.ts_ms.cmp(&ts_ms)) {
         Ok(i) => funding[i].rate,
@@ -120,10 +125,10 @@ fn funding_at(funding: &[FundingPoint], ts_ms: i64) -> Decimal {
 
 pub async fn run_backtest(cfg: &BacktestConfig) -> Result<BacktestOutcome> {
     let cache = BacktestCache::open(&cfg.cache_path).await?;
-    let http = reqwest::Client::new();
+    let source = build_source(cfg.source);
 
     let candles = cache
-        .load_candles(&http, &cfg.coin, &cfg.interval, cfg.start_ms, cfg.end_ms)
+        .load_candles(source.as_ref(), &cfg.coin, &cfg.interval, cfg.start_ms, cfg.end_ms)
         .await?;
     if candles.len() < 2 {
         bail!(
@@ -136,30 +141,35 @@ pub async fn run_backtest(cfg: &BacktestConfig) -> Result<BacktestOutcome> {
         );
     }
     // ── Coverage check ──────────────────────────────────────────────────────
-    // Hyperliquid retains ONLY the most recent ~5000 candles and anchors every
-    // candleSnapshot response at the TAIL, so a window older than ~5000×interval is
-    // silently head-truncated (the fetch can never fill the missing head — it is
-    // purged server-side). Warn loudly when the replayed range does not cover the
-    // request; `report.json` records both the requested and the actual replayed range.
+    // Warn loudly when the replayed range does not cover the request; `report.json`
+    // records both the requested and the actual replayed range. Hyperliquid retains
+    // ONLY the most recent ~5000 candles and anchors every candleSnapshot response
+    // at the TAIL, so a window older than ~5000×interval is silently head-truncated
+    // (the fetch can never fill the missing head — it is purged server-side); other
+    // sources may simply not have data that far back yet cached/fetched.
     let step_ms = (candles[1].ts_ms - candles[0].ts_ms).max(1);
     let first_ms = candles[0].ts_ms;
     let last_ms = candles.last().unwrap().ts_ms;
     let head_gap = first_ms - cfg.start_ms;
     let tail_gap = cfg.end_ms - (last_ms + step_ms);
     if head_gap > 2 * step_ms || tail_gap > 2 * step_ms {
+        let retention_note = if cfg.source == SourceKind::Hyperliquid {
+            " Hyperliquid retains only the most recent ~5000 candles and anchors responses at the \
+              tail, so windows older than ~5000×interval are truncated."
+        } else {
+            ""
+        };
         tracing::warn!(
             "⚠️  requested [{}, {}) but replay only covers [{}, {}]: ~{} min head / ~{} min tail \
-             uncovered. Hyperliquid retains only the most recent ~5000 candles and anchors \
-             responses at the tail, so windows older than ~5000×interval are truncated. The \
-             summary/report start/end reflect the REQUEST; see replayed_start_ms/replayed_end_ms \
-             for what was actually replayed.",
+             uncovered.{} The summary/report start/end reflect the REQUEST; see \
+             replayed_start_ms/replayed_end_ms for what was actually replayed.",
             cfg.start_ms, cfg.end_ms, first_ms, last_ms,
-            head_gap.max(0) / 60_000, tail_gap.max(0) / 60_000,
+            head_gap.max(0) / 60_000, tail_gap.max(0) / 60_000, retention_note,
         );
     }
 
     let funding = cache
-        .load_funding(&http, &cfg.coin, cfg.start_ms, cfg.end_ms)
+        .load_funding(source.as_ref(), &cfg.coin, cfg.start_ms, cfg.end_ms)
         .await?;
     info!(
         "▶️  replay: {} candles, {} funding points [{}]",
@@ -249,7 +259,14 @@ pub async fn run_backtest(cfg: &BacktestConfig) -> Result<BacktestOutcome> {
 
         // ── Synthesize snapshot + context ───────────────────────────────────────
         let funding_rate = funding_at(&funding, ts);
-        let snapshot = synth.on_tick(&clock, candle, market.close_wall, market.strike, funding_rate);
+        let snapshot = synth.on_tick(
+            &clock,
+            candle,
+            market.close_wall,
+            market.strike,
+            funding_rate,
+            source.funding_period_hours(),
+        );
         let realized = ledger.realized();
         let ctx = StrategyContext {
             market: market.config.clone(),

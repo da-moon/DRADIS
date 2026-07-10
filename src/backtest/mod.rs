@@ -3,10 +3,12 @@
 //! # What this is
 //!
 //! A feature-gated (`--features backtest`) offline harness that replays historical
-//! Hyperliquid 1-minute candles + funding through the SAME `Strategy` trait objects
-//! the live bot runs (`StrategyRegistry::create_all_strategies()`), behind the W1
-//! clock seam (`ctx.wall_now` / `ctx.mono_now`) so every warmup / staleness /
-//! cooldown / hold-time gate evaluates against HISTORICAL time at any replay speed.
+//! 1-minute candles + funding through the SAME `Strategy` trait objects the live bot
+//! runs (`StrategyRegistry::create_all_strategies()`), behind the W1 clock seam
+//! (`ctx.wall_now` / `ctx.mono_now`) so every warmup / staleness / cooldown /
+//! hold-time gate evaluates against HISTORICAL time at any replay speed. Historical
+//! data comes from a selectable provider (`--source`): Hyperliquid (default) or
+//! Binance FAPI — see [`source`].
 //!
 //! Two PnL views are produced, deliberately labelled:
 //!   1. **Native Decimal ledger** (authoritative) — prices the actual binary YES/NO
@@ -35,7 +37,8 @@
 //!
 //! `hyperliquid-backtest` is deliberately NOT a dependency: its advertised
 //! fetch/backtest/report API is unreachable dead code in the published crate.
-//! Funding/candles are fetched directly from `https://api.hyperliquid.xyz/info`.
+//! Funding/candles are fetched directly from the API of the selected data source
+//! (Hyperliquid public info API or Binance FAPI, via `--source`).
 
 pub mod fetch;
 pub mod clock;
@@ -46,11 +49,13 @@ pub mod bridge;
 pub mod report;
 pub mod llm_score;
 pub mod entry;
+pub mod source;
 
 pub use clock::ReplayClock;
 pub use fetch::{BacktestCache, Candle, FundingPoint};
 pub use harness::{BacktestConfig, run_backtest};
-pub use synth::{book_model, normalize_funding_8h, BookQuote, SnapshotSynthesizer};
+pub use source::{build_source, HistoricalSource, SourceKind};
+pub use synth::{book_model, normalize_funding, normalize_funding_8h, BookQuote, SnapshotSynthesizer};
 
 /// Fidelity-tier disclaimer block, printed verbatim by the CLI and mirrored in the
 /// README. Kept in one place so the two never drift.

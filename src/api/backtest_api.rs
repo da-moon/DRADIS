@@ -29,6 +29,7 @@ use serde_json::json;
 use crate::api::server::ApiState;
 use crate::backtest::entry::{parse_time, run_and_collect, EquityPoint, TradeRecord};
 use crate::backtest::harness::BacktestConfig;
+use crate::backtest::source::SourceKind;
 
 /// Default backtest cache — the CLI default; a SEPARATE sqlite file from the live DB.
 const DEFAULT_CACHE_PATH: &str = "backtest_cache.sqlite";
@@ -64,6 +65,7 @@ pub struct RunParamsEcho {
     pub starting: String,
     pub strategies: Option<Vec<String>>,
     pub llm_score: bool,
+    pub source: String,
 }
 
 /// One registry entry — the full record served by `GET /api/backtest/runs/{id}`.
@@ -239,6 +241,10 @@ pub struct RunRequest {
     pub strategies: Option<Vec<String>>,
     #[serde(default)]
     pub llm_score: Option<bool>,
+    /// Historical-data provider: "hyperliquid" (default) | "binance". Both hit
+    /// public, unauthenticated endpoints — there is no key to configure.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Parse an optional Decimal knob, falling back to `default` when empty/absent.
@@ -300,6 +306,12 @@ fn build_config(req: &RunRequest) -> anyhow::Result<BacktestConfig> {
         })
         .filter(|v| !v.is_empty());
 
+    let source = match req.source.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => SourceKind::Hyperliquid,
+        Some(s) => <SourceKind as clap::ValueEnum>::from_str(s, true)
+            .map_err(|_| anyhow::anyhow!("invalid source '{s}' (valid: hyperliquid | binance)"))?,
+    };
+
     Ok(BacktestConfig {
         crypto_filter: coin.to_lowercase(),
         coin,
@@ -315,6 +327,7 @@ fn build_config(req: &RunRequest) -> anyhow::Result<BacktestConfig> {
         cache_path: DEFAULT_CACHE_PATH.to_string(),
         out_dir: "backtest_out".to_string(),
         sigma_window: 60,
+        source,
     })
 }
 
@@ -330,6 +343,7 @@ fn params_echo(cfg: &BacktestConfig) -> RunParamsEcho {
         starting: cfg.starting_collateral.to_string(),
         strategies: cfg.strategies.clone(),
         llm_score: cfg.llm_score,
+        source: cfg.source.as_str().to_string(),
     }
 }
 
@@ -433,6 +447,7 @@ mod tests {
             starting: "500".into(),
             strategies: None,
             llm_score: false,
+            source: "hyperliquid".into(),
         }
     }
 
@@ -544,6 +559,7 @@ mod tests {
             starting: None,
             strategies: None,
             llm_score: None,
+            source: None,
         };
         let neg_spread = RunRequest { spread: Some("-0.02".into()), ..base() };
         assert!(build_config(&neg_spread).is_err(), "negative spread rejected");
@@ -570,6 +586,7 @@ mod tests {
             starting: None,
             strategies: None,
             llm_score: None,
+            source: None,
         };
         let cfg = build_config(&req).unwrap();
         assert_eq!(cfg.coin, "BTC");
@@ -595,7 +612,66 @@ mod tests {
             starting: None,
             strategies: None,
             llm_score: None,
+            source: None,
         };
         assert!(build_config(&req).is_err());
+    }
+
+    #[test]
+    fn build_config_defaults_to_hyperliquid() {
+        let req = RunRequest {
+            coin: "BTC".into(),
+            start: "1000000000".into(),
+            end: "1000003600".into(),
+            interval: None,
+            spread: None,
+            depth: None,
+            commission: None,
+            starting: None,
+            strategies: None,
+            llm_score: None,
+            source: None,
+        };
+        let cfg = build_config(&req).unwrap();
+        assert_eq!(cfg.source, SourceKind::Hyperliquid);
+    }
+
+    #[test]
+    fn build_config_accepts_binance_case_insensitive() {
+        let base = |source: &str| RunRequest {
+            coin: "BTC".into(),
+            start: "1000000000".into(),
+            end: "1000003600".into(),
+            interval: None,
+            spread: None,
+            depth: None,
+            commission: None,
+            starting: None,
+            strategies: None,
+            llm_score: None,
+            source: Some(source.into()),
+        };
+        let cfg = build_config(&base("binance")).unwrap();
+        assert_eq!(cfg.source, SourceKind::Binance);
+        let cfg = build_config(&base("BINANCE")).unwrap();
+        assert_eq!(cfg.source, SourceKind::Binance);
+    }
+
+    #[test]
+    fn build_config_rejects_unknown_source() {
+        let req = RunRequest {
+            coin: "BTC".into(),
+            start: "1000000000".into(),
+            end: "1000003600".into(),
+            interval: None,
+            spread: None,
+            depth: None,
+            commission: None,
+            starting: None,
+            strategies: None,
+            llm_score: None,
+            source: Some("kraken".into()),
+        };
+        assert!(build_config(&req).is_err(), "unknown source 'kraken' rejected");
     }
 }
