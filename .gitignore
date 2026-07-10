@@ -3,6 +3,10 @@
 **/*.rs.bk
 Cargo.lock
 
+# Backtest runtime artifacts (SQLite cache + report output)
+backtest_cache.sqlite
+backtest_out/
+
 # Environment / Secrets (CRITICAL - Never commit!)
 .env
 .env.*
