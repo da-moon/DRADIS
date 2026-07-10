@@ -11,7 +11,9 @@
 //!   • velocity_1s  — Δprice over the short window (`MOMENTUM_SHORT_WINDOW_SECS`, 1s);
 //!                    falls back to velocity_5s when no sub-1s history exists yet
 //!   • acceleration — Δ(velocity_5s) since the previous tick
-//!   • drift_60m    — Δprice over a full trailing hour (0 until ≥3600s of history)
+//!   • drift_60m    — Δprice over the trailing 60m window, active once
+//!                    ≥`DRIFT_60M_MIN_WINDOW_SECS` of history exists (graceful
+//!                    degradation so the exhaustion gate isn't blind after restart)
 //!   • drift_10m    — Δprice over the trailing 10m window, active once ≥60s of
 //!                    history exists (fills the 5s–60m gap for GBoost feature [18])
 //!
@@ -110,13 +112,16 @@ impl PriceKinematics {
                 break;
             }
         }
-        let drift_60m = if self.price_history_60m.len() > 1 {
-            if let Some((oldest_t, oldest_p)) = self.price_history_60m.front() {
-                if now.duration_since(*oldest_t).as_secs() >= 3600 {
-                    price - oldest_p
-                } else {
-                    dec!(0)
-                }
+        // Graceful degradation (mirrors drift_10m below): once at least
+        // DRIFT_60M_MIN_WINDOW_SECS of history exists, report the drift over
+        // whatever window IS available rather than staying 0 until a full
+        // hour accrues.  The prior all-or-nothing `>= 3600s` check left the
+        // Convergence 60m-exhaustion gate blind for a full hour after every
+        // restart.  A shorter window yields a smaller drift → conservative.
+        let drift_60m = if let Some((oldest_t, oldest_p)) = self.price_history_60m.front() {
+            let window_secs = now.duration_since(*oldest_t).as_secs();
+            if window_secs >= config::DRIFT_60M_MIN_WINDOW_SECS {
+                price - oldest_p
             } else {
                 dec!(0)
             }
@@ -226,19 +231,32 @@ mod tests {
     }
 
     #[test]
-    fn drift_60m_requires_full_hour() {
+    fn drift_60m_degrades_gracefully_from_min_window() {
         let mut k = PriceKinematics::new();
         let t0 = Instant::now();
 
         k.on_price(t0, dec!(100));
-        // 10 minutes in — not yet an hour, so 60m drift is still 0.
-        let mid = k.on_price(t0 + Duration::from_secs(600), dec!(180));
-        assert_eq!(mid.drift_60m, dec!(0));
+        // Under DRIFT_60M_MIN_WINDOW_SECS of history → 60m drift is still 0.
+        let early = k.on_price(
+            t0 + Duration::from_secs(config::DRIFT_60M_MIN_WINDOW_SECS - 1),
+            dec!(180),
+        );
+        assert_eq!(early.drift_60m, dec!(0));
 
-        // A full hour of span → 60m drift activates against the oldest point.
+        // Once the minimum window accrues, the drift over the AVAILABLE window
+        // activates (graceful degradation — no full hour required).
         let mut k2 = PriceKinematics::new();
         k2.on_price(t0, dec!(100));
-        let hour = k2.on_price(t0 + Duration::from_secs(3600), dec!(250));
+        let mid = k2.on_price(
+            t0 + Duration::from_secs(config::DRIFT_60M_MIN_WINDOW_SECS),
+            dec!(180),
+        );
+        assert_eq!(mid.drift_60m, dec!(80)); // 180 - 100
+
+        // A full hour of span still measures against the oldest point.
+        let mut k3 = PriceKinematics::new();
+        k3.on_price(t0, dec!(100));
+        let hour = k3.on_price(t0 + Duration::from_secs(3600), dec!(250));
         assert_eq!(hour.drift_60m, dec!(150)); // 250 - 100
     }
 
