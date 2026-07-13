@@ -129,14 +129,6 @@ fn obi_from_depths(bid: rust_decimal::Decimal, ask: rust_decimal::Decimal) -> f6
     }
 }
 
-/// Compute historical volatility regime from a slice of oracle prices (log-return std-dev).
-/// Normalised to [0, 1] where 1.0 = 2% per-tick std-dev (extreme volatility).
-fn compute_historical_volatility(prices: &[f64]) -> f64 {
-    // Delegates to the shared helper so the GBoost flatness gate and the Price
-    // raptor's periodic telemetry compute realized volatility identically.
-    crate::helpers::volatility::normalized_hist_vol(prices)
-}
-
 /// Compute tick-direction momentum from a slice of YES bid prices.
 /// Returns (up_ticks − down_ticks) / (n−1), normalised to [−1, +1].
 fn compute_tick_momentum(bids: &[rust_decimal::Decimal]) -> f64 {
@@ -156,14 +148,16 @@ fn compute_tick_momentum(bids: &[rust_decimal::Decimal]) -> f64 {
     (up_ticks as f64 - down_ticks as f64) / comparisons
 }
 
-/// Compute hist_vol from a position in the history VecDeque (looks back up to 60 snapshots).
+/// Read the canonical 60-min realized-vol captured on the snapshot at position `idx`.
+///
+/// Previously this recomputed volatility from a 60-sample window of `oracle_price`.
+/// At the 50ms patrol cadence that window spans only ~3 seconds and is dominated by
+/// duplicate oracle prints (the Binance watch channel updates far slower than the
+/// tick), collapsing log-returns to ~0 → a literal 0.0000 that permanently vetoed the
+/// flatness gate.  The Price raptor now stamps each snapshot with a proper 60-minute
+/// `hist_vol` (computed off the always-live Binance feed), so we simply read it.
 fn hist_vol_from_deque(h: &VecDeque<MarketSnapshot>, idx: usize) -> f64 {
-    let start = idx.saturating_sub(59);
-    let prices: Vec<f64> = (start..=idx)
-        .filter_map(|k| h.get(k))
-        .map(|s| s.oracle_price.to_f64().unwrap_or(1.0))
-        .collect();
-    compute_historical_volatility(&prices)
+    h.get(idx).map(|s| s.hist_vol.to_f64().unwrap_or(0.0)).unwrap_or(0.0)
 }
 
 /// Compute tick_momentum from a position in the history VecDeque (looks back up to 10 snapshots).
@@ -176,14 +170,10 @@ fn tick_momentum_from_deque(h: &VecDeque<MarketSnapshot>, idx: usize) -> f64 {
     compute_tick_momentum(&bids)
 }
 
-/// Compute hist_vol from a position in a `&[MarketSnapshot]` slice (used in concept-drift path).
+/// Read the canonical 60-min realized-vol captured on the snapshot at position `idx`
+/// (slice variant, used in the concept-drift / retrain reconstruction path).
 fn hist_vol_from_slice(snaps: &[MarketSnapshot], idx: usize) -> f64 {
-    let start = idx.saturating_sub(59);
-    let prices: Vec<f64> = snaps[start..=idx]
-        .iter()
-        .map(|s| s.oracle_price.to_f64().unwrap_or(1.0))
-        .collect();
-    compute_historical_volatility(&prices)
+    snaps.get(idx).map(|s| s.hist_vol.to_f64().unwrap_or(0.0)).unwrap_or(0.0)
 }
 
 /// Compute tick_momentum from a position in a `&[MarketSnapshot]` slice.
@@ -1019,6 +1009,7 @@ impl Strategy for GboostStrategyImpl {
             s.funding_rate     = ctx.snapshot.funding_rate;
             s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
             s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            s.hist_vol         = ctx.snapshot.hist_vol;
             s.institutional_pulse = ctx.snapshot.institutional_pulse;
             s.tide_coherence      = ctx.snapshot.tide_coherence;
             s.oi_delta_pct        = ctx.snapshot.oi_delta_pct;
@@ -1137,6 +1128,7 @@ impl Strategy for GboostStrategyImpl {
             s.funding_rate     = ctx.snapshot.funding_rate;
             s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
             s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            s.hist_vol         = ctx.snapshot.hist_vol;
             s.institutional_pulse = ctx.snapshot.institutional_pulse;
             s.tide_coherence      = ctx.snapshot.tide_coherence;
             s.oi_delta_pct        = ctx.snapshot.oi_delta_pct;
@@ -1189,7 +1181,7 @@ impl Strategy for GboostStrategyImpl {
         }
 
         if let Some(close_time) = target_market.market_close_time {
-            if (close_time - ctx.wall_now).num_seconds() < config::GBOOST_MIN_SECS_TO_EXPIRY {
+            if (close_time - ctx.wall_now).num_seconds() < dc.gboost_min_secs_to_expiry {
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -1376,14 +1368,14 @@ impl Strategy for GboostStrategyImpl {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
             let yes_obi = Self::side_obi(true, target_snapshot);
-            if yes_obi < config::GBOOST_OBI_ADVERSE_BLOCK {
+            if yes_obi < dc.gboost_obi_adverse_block {
                 veto!("adverse OBI");
             }
             // ── OBI exhaustion gate ───────────────────────────────────────────
             // When |obi| is very large the move is already mature — entering YES
             // into an already-resolved book is tail-chasing with maximum adverse
             // selection. 2026-05-08 T2: |obi_y|=0.61 on a ~93% YES market → SL -$0.457.
-            if yes_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+            if yes_obi.abs() > dc.gboost_obi_exhaustion_block {
                 veto!("OBI exhaustion");
             }
             // ── Hourly OBI direction check for daily entries ──────────────────
@@ -1403,13 +1395,13 @@ impl Strategy for GboostStrategyImpl {
                 // market, dragging daily YES down with it.
                 // 2026-05-24 11:39: hourly YES OBI=0.85 at entry → price fell from $0.54
                 // to $0.49 in 45 s (-$0.26 loss).  Blocked at OBI_EXHAUSTION_BLOCK=0.80.
-                if hourly_yes_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+                if hourly_yes_obi.abs() > dc.gboost_obi_exhaustion_block {
                     veto!("hourly OBI exhausted");
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.yes_ask);
-            if price >= config::GBOOST_MAX_YES_ENTRY_PRICE
-                || price < config::GBOOST_MIN_ENTRY_PRICE
+            if price >= dc.gboost_max_yes_entry_price
+                || price < dc.gboost_min_entry_price
                 || price <= dec!(0)
             {
                 veto!("YES price out of range");
@@ -1418,7 +1410,7 @@ impl Strategy for GboostStrategyImpl {
             // Near 0.50 the market is directionally undecided. With 10% round-trip
             // taker fees, GBoost needs > 10% price move to break even — impossible
             // in a 50/50 coin flip. Require minimum edge distance from fair value.
-            if (price - dec!(0.50)).abs() < config::GBOOST_MIN_EDGE_FROM_FAIR {
+            if (price - dec!(0.50)).abs() < dc.gboost_min_edge_from_fair {
                 veto!("price too close to 0.50");
             }
             // Confidence-proportional sizing: more capital for higher-conviction signals.
@@ -1438,7 +1430,7 @@ impl Strategy for GboostStrategyImpl {
                 let expected_gross = trade_usdc * tp_pct;
                 let estimated_fee  = trade_usdc * fee_roundtrip;
                 let net_expected   = expected_gross - estimated_fee;
-                if net_expected < config::GBOOST_MIN_NET_PROFIT_USDC {
+                if net_expected < dc.gboost_min_net_profit_usdc {
                     veto!("net profit too low");
                 }
             }
@@ -1496,13 +1488,13 @@ impl Strategy for GboostStrategyImpl {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
             let no_obi = Self::side_obi(false, target_snapshot);
-            if no_obi < config::GBOOST_OBI_ADVERSE_BLOCK {
+            if no_obi < dc.gboost_obi_adverse_block {
                 veto!("adverse OBI");
             }
             // ── OBI exhaustion gate ───────────────────────────────────────────
             // Blocks NO entries where the book is already heavily one-sided against
             // the NO leg — the move is in progress and the risk/reward is exhausted.
-            if no_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+            if no_obi.abs() > dc.gboost_obi_exhaustion_block {
                 veto!("OBI exhaustion");
             }
             // ── Hourly OBI direction check for daily entries ──────────────────
@@ -1522,19 +1514,19 @@ impl Strategy for GboostStrategyImpl {
                 // bid-dominated (OBI > +threshold), the NO-side momentum is exhausted and
                 // a reversal is imminent.  Entering daily NO at this point means buying
                 // into the last ticks of a NO surge — adverse selection is at its peak.
-                if hourly_no_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+                if hourly_no_obi.abs() > dc.gboost_obi_exhaustion_block {
                     veto!("hourly OBI exhausted");
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.no_ask);
-            if price > config::GBOOST_MAX_NO_ENTRY_PRICE
-                || price < config::GBOOST_MIN_ENTRY_PRICE
+            if price > dc.gboost_max_no_entry_price
+                || price < dc.gboost_min_entry_price
                 || price <= dec!(0)
             {
                 veto!("NO price out of range");
             }
             // ── 50-cent coin-flip zone gate ───────────────────────────────────
-            if (price - dec!(0.50)).abs() < config::GBOOST_MIN_EDGE_FROM_FAIR {
+            if (price - dec!(0.50)).abs() < dc.gboost_min_edge_from_fair {
                 veto!("price too close to 0.50");
             }
             // Confidence for NO direction is (1 - p_yes_up); scale size accordingly.
@@ -1548,7 +1540,7 @@ impl Strategy for GboostStrategyImpl {
                 let expected_gross = trade_usdc * tp_pct;
                 let estimated_fee  = trade_usdc * fee_roundtrip;
                 let net_expected   = expected_gross - estimated_fee;
-                if net_expected < config::GBOOST_MIN_NET_PROFIT_USDC {
+                if net_expected < dc.gboost_min_net_profit_usdc {
                     veto!("net profit too low");
                 }
             }
@@ -1602,7 +1594,7 @@ impl Strategy for GboostStrategyImpl {
         };
 
         let p_yes_up           = self.predict(target_snapshot);
-        let signal_exit_thresh = config::GBOOST_SIGNAL_EXIT_THRESHOLD.to_f64().unwrap_or(0.40);
+        let signal_exit_thresh = dc.gboost_signal_exit_threshold.to_f64().unwrap_or(0.40);
         let tp                 = dc.gboost_target_profit_pct.to_f64().unwrap_or(0.15);
         let sl                 = dc.gboost_stop_loss_pct.to_f64().unwrap_or(0.10);
 
@@ -1775,6 +1767,7 @@ mod tests {
             velocity: dec!(50), velocity_1s: dec!(10), acceleration: dec!(5),
             funding_rate: dec!(0.0001), oracle_drift_60m: dec!(100),
             oracle_drift_10m: dec!(30), // ~10min drift for test
+            hist_vol: dec!(0.003), // normal live-BTC 60m realized-vol — clears GBOOST_MIN_HIST_VOL
             institutional_pulse: dec!(0.5), tide_coherence: dec!(0.7),
             oi_delta_pct: dec!(0.01), cvd_ratio: dec!(1.2),
             secs_to_expiry: 3600, // 1 hour — mid-range for tests

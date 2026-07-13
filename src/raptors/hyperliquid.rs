@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::api::server::AssetRaptorHealth;
 use crate::config;
+use crate::helpers::volatility::normalized_hist_vol;
 use crate::raptors::derivatives::DerivativesSnapshot;
 use crate::raptors::kinematics::PriceKinematics;
 use crate::raptors::source;
@@ -47,7 +48,9 @@ pub async fn run_hyperliquid_raptor(
     crypto_filter: String,
     oracle_tx: watch::Sender<Decimal>,
     velocity_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
-    drift_tx: watch::Sender<(Decimal, Decimal)>,
+    // Sends (drift_60m, drift_10m, hist_vol) — matches the Binance price raptor's
+    // 3-tuple drift contract (hist_vol is the normalized [0,1] 60-min realized vol).
+    drift_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
     funding_tx: watch::Sender<Decimal>,
     deriv_tx: watch::Sender<DerivativesSnapshot>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
@@ -145,7 +148,12 @@ pub async fn run_hyperliquid_raptor(
                     last_kin_feed = Some(now);
                     let sig = kin.on_price(now, px);
                     let _ = velocity_tx.send((sig.velocity_5s, sig.velocity_1s, sig.acceleration));
-                    let _ = drift_tx.send((sig.drift_60m, sig.drift_10m));
+                    // Match the Binance raptor's 3-tuple drift contract (adds hist_vol).
+                    let hist_vol_norm = {
+                        let prices = kin.prices_60m_f64();
+                        Decimal::from_f64_retain(normalized_hist_vol(&prices)).unwrap_or(Decimal::ZERO)
+                    };
+                    let _ = drift_tx.send((sig.drift_60m, sig.drift_10m, hist_vol_norm));
                     raptor_health_tx.send_modify(|map| {
                         let h = map.entry(crypto_filter.clone()).or_default();
                         h.velocity_5s = sig.velocity_5s;

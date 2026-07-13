@@ -75,7 +75,7 @@ pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 /// Min conviction: dominant leg bid must be ≥ this to enter — restricts arb to deep
 /// near-settlement markets and rejects ≈0.50 coin-flips (core orphan guard). Balanced default.
-pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.80);
+pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.90);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
@@ -239,6 +239,11 @@ pub const MAKER_TAKER_FLOW_WINDOW_MS: u64 = 1500;
 pub const MAKER_TAKER_FLOW_MIN_ELAPSED_MS: u64 = 500;
 pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.40);
 pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.50);
+/// After a ToxicFill exit, block re-entry on that same token for this long.
+/// Prevents the maker from immediately re-quoting into a collapsing book and
+/// getting picked off again (the "double knife-catch" adverse-selection loss).
+/// Balanced: 3-minute re-entry lockout.
+pub const MAKER_TOXIC_REENTRY_COOLDOWN_SECS: i64 = 180;
 
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(300.0); // legacy — not used in logic
 /// Slow trend threshold as fraction of oracle price.
@@ -247,6 +252,9 @@ pub const MAKER_SLOW_TREND_THRESHOLD_PCT: Decimal = dec!(0.003);
 pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.03);
 
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 420;
+/// Throttle interval (secs) for MakerStrategy gate-rejection diagnostics — a gate
+/// reason is logged when it changes or after this interval, without per-tick spam.
+pub const MAKER_GATE_LOG_INTERVAL_SECS: u64 = 30;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 420;
 /// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (900s); 300s breathing room.
 pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1200;
@@ -424,7 +432,7 @@ pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.65);
 pub const GBOOST_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
 /// Minimum historical volatility regime required for a GBoost entry.
 /// Balanced: 0.002 — default value; blocks entries when the oracle is completely flat.
-pub const GBOOST_MIN_HIST_VOL: f64 = 0.020; // Raised from 0.002: blocks entries when oracle is frozen (2026-06-17 T1 root cause)
+pub const GBOOST_MIN_HIST_VOL: f64 = 0.0010; // Recalibrated from 0.020 (2026-07-10): normal BTC 60m realized-vol is ~0.0025-0.0035; old floor blocked ALL entries. Blocks frozen oracle (~0.0), admits live BTC.
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
@@ -727,6 +735,10 @@ pub const MIN_HOURLY_MARKET_VOL24H: f64 = 500.0;
 
 pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(15);
 pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(12);
+/// USDC notional per resting maker quote. Drives order size and net-exposure
+/// projection; kept ≤ half of MAKER_MAX_EXPOSURE_USDC so the maker has room to
+/// quote both sides without tripping the exposure cap.
+pub const MAKER_QUOTE_SIZE_USDC: Decimal = dec!(6);
 pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(35);
 pub const ARBITRAGE_POSITION_SIZE_USDC: Decimal = dec!(10.0);
 pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(36);
@@ -950,15 +962,15 @@ pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.55);
 pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.50); // 2026-06-30: block entry into adverse order-book imbalance
 
 /// Entry-relative take-profit and stop-loss.
-pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
+pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08); // 2026-07-10: 0.15 never hit (decay-exit first); 8% (~+5.7% net) stops fee-eroded 5% scalps. LIVE knob overrides in prod.
 pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Catastrophic stop applied BEFORE fill-confirmation (negative = loss fraction).
-pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.20);
+pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.15); // 2026-07-10: tightened from -0.20 — caps the fast-whipsaw tail (9 trades -16 to -24%) ~6-8pts.
 
 /// Catastrophic backstop = this multiple of the live stop-loss, clamped to
 /// CONVERGENCE_CATASTROPHIC_SL_PCT. Scales the hard floor with a tight stop.
-pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(2.0);
+pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(1.5); // 2026-07-10: 2.0 -> 1.5 tightens catastrophic across the live-stop range (-15% at a 10% stop).
 
 /// After a catastrophic stop, block BOTH legs of that market for this long.
 pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;

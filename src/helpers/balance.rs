@@ -67,7 +67,8 @@ pub async fn sync_position_balance(
     baseline_shares: Decimal,
     max_wait_secs: i64,
     token_ownership: &Arc<Mutex<HashMap<MarketId, String>>>,
-) -> Result<()> {
+    post_only: bool,
+) -> Result<bool> {
     // Slice 2b: resolve the on-chain U256 once; the rest of the body is unchanged.
     let token_id = u256_from_market_id(token_id)?;
     let market = market_id_from_u256(token_id);
@@ -109,7 +110,7 @@ pub async fn sync_position_balance(
                 info!("⚖️ Position Synced [{}]: Token {} updated to actual: {}", strategy_name, token_id, actual_shares);
                 pos.shares = actual_shares;
                 if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
-                return Ok(());
+                return Ok(true);
             } else if actual_shares == dec!(0) {
                 if time_since_open >= max_wait_secs {
                     drop(pos_map);
@@ -138,8 +139,19 @@ pub async fn sync_position_balance(
                                     pos.shares = latest_actual;
                                     if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
                                 }
-                                return Ok(());
+                                return Ok(true);
                             }
+                        }
+                        // Genuinely-resting post-only maker quote that simply wasn't hit
+                        // within the window is NOT a phantom — it's a normal unfilled
+                        // quote we just cancelled for refresh.  Clear it quietly with no
+                        // ERROR and no phantom cooldown so the maker can re-quote.
+                        if post_only {
+                            info!("💤 Maker quote expired unfilled [{}]: Token {} rested {}s without a fill — cancelled for refresh (no penalty)",
+                                  strategy_name, token_id, time_since_open);
+                            positions.lock().await.remove(&key);
+                            token_ownership.lock().await.remove(&market);
+                            return Ok(false);
                         }
                     }
                     error!("⚠️ Position Sync FAILED [{}] Token {} — phantom removed.", strategy_name, token_id);
@@ -149,13 +161,15 @@ pub async fn sync_position_balance(
                     if let Some(cooldowns) = phantom_cooldowns {
                         cooldowns.lock().await.insert(format!("{}:{}", strategy_name, token_id), Instant::now());
                     }
-                    return Ok(());
+                    return Ok(false);
                 } else {
                     if time_since_open > 15 {
+                        // A resting post-only maker quote sitting at 0 balance is the
+                        // EXPECTED state (waiting for a taker), so keep it at debug.
                         // First warning fires at ~15s.  After that, throttle to once per
                         // 60 seconds so GTC orders resting on a slow daily market don't
                         // flood the log with hundreds of identical WARN lines.
-                        if time_since_open <= 20 || time_since_open % 60 < 4 {
+                        if !post_only && (time_since_open <= 20 || time_since_open % 60 < 4) {
                             warn!("⚠️ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);
                         } else {
                             debug!("⏳ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);
@@ -165,7 +179,7 @@ pub async fn sync_position_balance(
                     tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
                     continue;
                 }
-            } else { return Ok(()); }
+            } else { return Ok(false); }
         } else {
             // Position key not yet in the map (race between order submission and on-chain
             // confirmation).  Must explicitly drop the guard before sleeping — holding a
@@ -174,7 +188,7 @@ pub async fn sync_position_balance(
             // (tokio Mutex is non-reentrant: same task trying to re-lock → hangs forever).
             drop(pos_map);
             tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
-            if !positions.lock().await.contains_key(&key) { return Ok(()); }
+            if !positions.lock().await.contains_key(&key) { return Ok(false); }
         }
     }
 }
@@ -197,6 +211,21 @@ async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, 
           id_refs.len(), token_id);
     let _ = client.cancel_orders(&id_refs).await;
     true
+}
+
+/// Public reactive quote-pull entry point: cancel any resting order on `token_id`.
+/// Used by the Maker's book-turn quote-pull (patrol `MakerCancel` handling) to pull
+/// an UNFILLED resting quote before informed flow picks it off. Resolves the
+/// on-chain U256 from the venue-neutral `MarketId`, then delegates to
+/// [`cancel_resting_orders`]. Returns true if any resting order was cancelled.
+pub async fn cancel_resting_orders_for_token(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    token_id: &MarketId,
+) -> bool {
+    match u256_from_market_id(token_id) {
+        Ok(u) => cancel_resting_orders(client, u).await,
+        Err(_) => false,
+    }
 }
 
 /// Reconcile on-chain token balances against the in-memory position map.

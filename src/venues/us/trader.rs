@@ -563,6 +563,7 @@ fn build_snapshot(
         no_bid:  nb, no_bid_depth:  nbd, no_ask:  na, no_ask_depth:  nad,
         oracle_price: dec!(0), velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
         funding_rate: dec!(0), oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0),
+        hist_vol: dec!(0),
         institutional_pulse: dec!(0), tide_coherence: dec!(0),
         oi_delta_pct: dec!(0), cvd_ratio: dec!(0),
         secs_to_expiry: 0, timestamp: Utc::now(),
@@ -673,6 +674,25 @@ async fn dispatch_signal(
                 if dispatch_single(venue, pool, positions, lifecycle, strategy_name, q, Side::Buy, starting).await {
                     acted = true;
                 }
+            }
+            acted
+        }
+        StrategySignal::MakerCancel { tokens } => {
+            // Reactive quote-pull: cancel resting UNFILLED maker orders on these
+            // tokens (book turned toxic before fill). Cancel via the venue's
+            // open-orders surface, then drop the strategy's phantom guard.
+            let mut acted = false;
+            let open = venue.open_orders().await.unwrap_or_default();
+            for tok in &tokens {
+                for ord in open.iter().filter(|o| &o.market == tok) {
+                    if let Err(e) = venue.cancel(ord.order_id.clone()).await {
+                        warn!("[{strategy_name}] maker quote-pull cancel failed for {} ({}): {e}", ord.order_id, tok);
+                    } else {
+                        info!("🚫 [{strategy_name}] maker quote-pulled: {} — resting order cancelled (toxic book)", tok);
+                        acted = true;
+                    }
+                }
+                positions.lock().await.remove(&(strategy_name.to_string(), tok.clone()));
             }
             acted
         }
@@ -795,7 +815,7 @@ fn register_us_squadron(
     // not from Raptors). Receivers stay valid after the senders drop.
     let (_, oracle_rx) = watch::channel(Decimal::ZERO);
     let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
-    let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO));
+    let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
     // The venue-neutral Sports Raptor IS a real feed on the US build — attach it
     // so its observe-only line-movement signal is available to US squadrons.
     let mut raptors = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);

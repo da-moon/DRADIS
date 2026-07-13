@@ -18,6 +18,7 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::time::Instant;
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -35,6 +36,58 @@ struct DepthSample {
     sampled_at: Instant,
 }
 
+/// Returns the first entry sub-gate a single side (YES or NO) fails, or `None`
+/// if the side qualifies.  The first element is a STABLE category key (no live
+/// numbers) used for log throttling; the second is a human-readable detail
+/// string with the live values.  Keeping the throttle key stable prevents the
+/// 50 ms tick loop from defeating the throttle via fluctuating price numbers.
+fn side_reject_reason(
+    book_ok: bool,
+    taker_block: bool,
+    toxic_cooldown: bool,
+    spread: Decimal,
+    bid_price: Decimal,
+    ask: Decimal,
+    complementary_bid: Decimal,
+    velocity_block: bool,
+    dc: &crate::helpers::dynamic_config::DynamicConfig,
+) -> Option<(&'static str, String)> {
+    if !book_ok {
+        return Some(("book_imbalance", "book_imbalance".to_string()));
+    }
+    if taker_block {
+        return Some(("taker_flow_drain", "taker_flow_drain".to_string()));
+    }
+    if toxic_cooldown {
+        return Some(("toxic_cooldown", "toxic_cooldown (post-ToxicFill re-entry lockout)".to_string()));
+    }
+    if spread < dc.maker_min_spread {
+        return Some(("spread", format!("spread {:.3} < min {:.3}", spread, dc.maker_min_spread)));
+    }
+    if bid_price < dc.maker_min_entry_price {
+        return Some(("min_entry", format!("bid {:.3} < min_entry {:.3}", bid_price, dc.maker_min_entry_price)));
+    }
+    if bid_price > dc.maker_max_entry_price {
+        return Some(("max_entry", format!("bid {:.3} > max_entry {:.3}", bid_price, dc.maker_max_entry_price)));
+    }
+    if bid_price > ask - dc.maker_cross_buffer {
+        return Some(("cross_buffer", format!(
+            "cross_buffer: bid {:.3} > ask {:.3} - {:.3}",
+            bid_price, ask, dc.maker_cross_buffer
+        )));
+    }
+    if complementary_bid > dc.maker_max_complementary_price {
+        return Some(("complementary", format!(
+            "complementary {:.3} > max {:.3}",
+            complementary_bid, dc.maker_max_complementary_price
+        )));
+    }
+    if velocity_block {
+        return Some(("velocity_bias", "velocity_bias".to_string()));
+    }
+    None
+}
+
 pub struct MakerStrategyImpl {
     /// Per-strategy state: best-bid depths from the previous evaluation tick.
     /// Used to compute how fast bid depth is being consumed by takers within
@@ -43,11 +96,116 @@ pub struct MakerStrategyImpl {
     /// (tokio::join! in the executor).  evaluate_entry owns writes; evaluate_exit
     /// reads whatever sample is available (one-tick lag is acceptable for a gate).
     prev_depths: Mutex<Option<DepthSample>>,
+
+    /// Gate-diagnostics throttle: (last reason logged, when).  We log a gate
+    /// rejection whenever the reason changes OR MAKER_GATE_LOG_INTERVAL_SECS has
+    /// elapsed, so the reason a maker is silent is visible without spamming every
+    /// evaluation tick.
+    last_gate_log: Mutex<Option<(String, Instant)>>,
+
+    /// Throttle for the positive "quoting" log.  The eval loop runs on a ~50 ms
+    /// tick, so an unthrottled quote log would emit ~20×/sec; this caps it to one
+    /// line per MAKER_GATE_LOG_INTERVAL_SECS.
+    last_quote_log: Mutex<Option<Instant>>,
+}
+
+/// Process-global market-maturation tracker: market identity → first time ANY
+/// maker instance observed it.  Must be global (not per-strategy) because the
+/// patrol loop rebuilds the strategy objects on every market rotation
+/// (`create_all_strategies()`), which would otherwise wipe the baseline and
+/// wrongly re-arm the 5-minute maturation blackout on a day-old daily maker
+/// market each hour.  Keyed on `market_name` (stable for the daily maker venue
+/// across hourly rotations; a genuinely new market gets a fresh entry, correctly
+/// re-arming maturation).  Survives rotations within a process; re-arms once on a
+/// full process restart (correct — a fresh process hasn't observed stability).
+fn maker_market_first_seen() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Seconds since a maker market identity was first observed by any instance.
+/// Returns 0 the first time an identity is seen (arming maturation) and grows
+/// monotonically thereafter, surviving strategy re-instantiation on rotation.
+fn market_age_secs(market_ident: &str) -> i64 {
+    let mut reg = match maker_market_first_seen().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let first_seen = reg.entry(market_ident.to_string()).or_insert_with(Instant::now);
+    first_seen.elapsed().as_secs() as i64
+}
+
+/// Process-global post-ToxicFill re-entry cooldown: token_id → the instant the
+/// last ToxicFill exit fired for that token.  Global (not a per-strategy field)
+/// for the same reason as `maker_market_first_seen`: patrol rebuilds the strategy
+/// objects on every market rotation (`create_all_strategies()`), which would wipe
+/// per-instance state and let the maker immediately re-quote into the very book it
+/// was just picked off in.  Keyed on the specific YES/NO token so only the toxic
+/// side is locked out; a genuinely new market gets a fresh token_id (no stale block).
+fn maker_toxic_cooldowns() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record that a ToxicFill exit just fired for `token_id`, arming the re-entry cooldown.
+fn arm_maker_toxic_cooldown(token_id: &str) {
+    let mut reg = match maker_toxic_cooldowns().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.insert(token_id.to_string(), Instant::now());
+}
+
+/// Returns true if `token_id` is still within its post-ToxicFill re-entry cooldown
+/// (i.e. fewer than `cooldown_secs` have elapsed since the last toxic exit).  A
+/// non-positive `cooldown_secs` disables the gate.  Expired entries are pruned on read.
+fn maker_toxic_cooldown_active(token_id: &str, cooldown_secs: i64) -> bool {
+    if cooldown_secs <= 0 {
+        return false;
+    }
+    let mut reg = match maker_toxic_cooldowns().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(t) = reg.get(token_id) {
+        if (t.elapsed().as_secs() as i64) < cooldown_secs {
+            return true;
+        }
+        reg.remove(token_id);
+    }
+    false
 }
 
 impl MakerStrategyImpl {
     pub fn new() -> Self {
-        Self { prev_depths: Mutex::new(None) }
+        Self {
+            prev_depths: Mutex::new(None),
+            last_gate_log: Mutex::new(None),
+            last_quote_log: Mutex::new(None),
+        }
+    }
+
+    /// Throttled gate-rejection logger.  `key` is a STABLE category (no live
+    /// numbers); `detail` carries the human-readable values.  Emits at INFO when
+    /// `key` differs from the last logged key, or when MAKER_GATE_LOG_INTERVAL_SECS
+    /// has passed since the last emit for the same key.  Throttling on the stable
+    /// key (not the detail) keeps the 50 ms tick loop from flooding the log when
+    /// live prices fluctuate.
+    async fn log_gate(&self, key: &str, detail: &str) {
+        let mut guard = self.last_gate_log.lock().await;
+        let should_log = match guard.as_ref() {
+            Some((prev_key, at)) => {
+                prev_key != key
+                    || at.elapsed().as_secs() >= config::MAKER_GATE_LOG_INTERVAL_SECS
+            }
+            None => true,
+        };
+        if should_log {
+            tracing::info!("🔒 Maker gate: {}", detail);
+            *guard = Some((key.to_string(), Instant::now()));
+        }
     }
 }
 
@@ -74,17 +232,31 @@ impl Strategy for MakerStrategyImpl {
 
 
         // ── Market maturation gate ────────────────────────────────────────────
-        let secs_since_market_start = (ctx.wall_now - ctx.market_started_at).num_seconds();
+        // Age is measured from when THIS maker market was first observed (keyed on
+        // market_name), not ctx.market_started_at — the latter resets on every
+        // hourly rotation and would wrongly re-arm the maturation blackout on a
+        // day-old daily maker market each hour.
+        let secs_since_market_start = market_age_secs(&market.market_name);
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
+            self.log_gate("market_age", &format!(
+                "market_age {}s < min {}s",
+                secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS
+            )).await;
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Expiry gate ───────────────────────────────────────────────────────
         if let Some(close_time) = market.market_close_time {
-            if (close_time - ctx.wall_now).num_seconds() < config::MAKER_MIN_SECS_TO_EXPIRY {
+            let secs_to_expiry = (close_time - ctx.wall_now).num_seconds();
+            if secs_to_expiry < dc.maker_min_secs_to_expiry {
+                self.log_gate("expiry", &format!(
+                    "secs_to_expiry {}s < min {}s",
+                    secs_to_expiry, dc.maker_min_secs_to_expiry
+                )).await;
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
+            self.log_gate("no_close_time", "no market_close_time").await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -95,11 +267,17 @@ impl Strategy for MakerStrategyImpl {
 
         // ── Orderbook imbalance gate ──────────────────────────────────────────
         let yes_book_ok = snapshot.yes_bid_depth > dec!(0)
-            && (snapshot.yes_ask_depth / snapshot.yes_bid_depth) <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+            && (snapshot.yes_ask_depth / snapshot.yes_bid_depth) <= dc.maker_max_book_imbalance_ratio;
         let no_book_ok  = snapshot.no_bid_depth > dec!(0)
-            && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+            && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= dc.maker_max_book_imbalance_ratio;
 
         if !yes_book_ok && !no_book_ok {
+            self.log_gate("book_imbalance", &format!(
+                "book_imbalance both sides (ratio>{:.1}): yes_bidD={:.0} yes_askD={:.0} | no_bidD={:.0} no_askD={:.0}",
+                dc.maker_max_book_imbalance_ratio,
+                snapshot.yes_bid_depth, snapshot.yes_ask_depth,
+                snapshot.no_bid_depth, snapshot.no_ask_depth
+            )).await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -191,7 +369,7 @@ impl Strategy for MakerStrategyImpl {
 
         // ── Pricing Logic ─────────────────────────────────────────────────────
         // Use a wider buffer to avoid long-unfilled GTC orders in slower books
-        let bid_buffer = if ctx.maker_market.is_some() { config::MAKER_BID_BUFFER } else { dec!(0.015) };
+        let bid_buffer = if ctx.maker_market.is_some() { dc.maker_bid_buffer } else { dec!(0.015) };
 
         let raw_yes_price = (snapshot.yes_ask - bid_buffer - skew).max(dc.maker_min_entry_price);
         let raw_no_price  = (snapshot.no_ask - bid_buffer + skew).max(dc.maker_min_entry_price);
@@ -201,49 +379,77 @@ impl Strategy for MakerStrategyImpl {
         // Previously used a hardcoded dec!(0.01) which allowed 1-tick spreads when
         // the skew (±0.03) exceeded the bid_buffer (0.025), triggering the cap.
         // Now uses the configured MAKER_CROSS_BUFFER constant (0.02) for consistency.
-        let yes_bid_price = floor_to_tick_size(raw_yes_price.min(snapshot.yes_ask - config::MAKER_CROSS_BUFFER));
-        let no_bid_price  = floor_to_tick_size(raw_no_price.min(snapshot.no_ask  - config::MAKER_CROSS_BUFFER));
+        let yes_bid_price = floor_to_tick_size(raw_yes_price.min(snapshot.yes_ask - dc.maker_cross_buffer));
+        let no_bid_price  = floor_to_tick_size(raw_no_price.min(snapshot.no_ask  - dc.maker_cross_buffer));
 
         let yes_spread = yes_ask - yes_bid;
         let no_spread  = no_ask - no_bid;
 
         // ── Qualification ─────────────────────────────────────────────────
+        // Post-ToxicFill re-entry lockout: if this token was picked off by a
+        // book-turn within the last `maker_toxic_reentry_cooldown_secs`, do not
+        // re-quote that side — avoids catching the same falling knife twice.
+        let cooldown_secs = dc.maker_toxic_reentry_cooldown_secs;
+        let yes_toxic_cooldown = maker_toxic_cooldown_active(market.yes_token.as_str(), cooldown_secs);
+        let no_toxic_cooldown  = maker_toxic_cooldown_active(market.no_token.as_str(), cooldown_secs);
+
         let yes_qualifies = yes_book_ok
             && !taker_flow_blocks_yes
-            && yes_spread >= config::MAKER_MIN_SPREAD
+            && !yes_toxic_cooldown
+            && yes_spread >= dc.maker_min_spread
             && yes_bid_price >= dc.maker_min_entry_price
             && yes_bid_price <= dc.maker_max_entry_price
-            && yes_bid_price <= snapshot.yes_ask - config::MAKER_CROSS_BUFFER
-            && no_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
+            && yes_bid_price <= snapshot.yes_ask - dc.maker_cross_buffer
+            && no_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_negative;
 
         let no_qualifies = no_book_ok
             && !taker_flow_blocks_no
-            && no_spread >= config::MAKER_MIN_SPREAD
+            && !no_toxic_cooldown
+            && no_spread >= dc.maker_min_spread
             && no_bid_price >= dc.maker_min_entry_price
             && no_bid_price <= dc.maker_max_entry_price
-            && no_bid_price <= snapshot.no_ask - config::MAKER_CROSS_BUFFER
-            && yes_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
+            && no_bid_price <= snapshot.no_ask - dc.maker_cross_buffer
+            && yes_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_positive;
 
         if !yes_qualifies && !no_qualifies {
+            let (yes_key, yes_detail) = side_reject_reason(
+                yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown, yes_spread, yes_bid_price,
+                snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
+            ).unwrap_or(("unknown", "unknown".to_string()));
+            let (no_key, no_detail) = side_reject_reason(
+                no_book_ok, taker_flow_blocks_no, no_toxic_cooldown, no_spread, no_bid_price,
+                snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
+            ).unwrap_or(("unknown", "unknown".to_string()));
+            self.log_gate(
+                &format!("noqual:{}/{}", yes_key, no_key),
+                &format!("no side qualifies | YES: {} | NO: {}", yes_detail, no_detail),
+            ).await;
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Net Exposure Risk Check ──────────────────────────────────────────
-        let trade_size = dec!(10.0);
+        // Quote size is config-driven and clamped to the exposure cap so a single
+        // quote from a flat book always fits under the limit (a quote larger than
+        // the cap would self-gate the maker after one clip).
+        let trade_size = dc.maker_quote_size_usdc.min(dc.maker_max_exposure_usdc);
         let projected_yes = yes_inv_value + (if yes_qualifies { trade_size } else { dec!(0.0) });
         let projected_no  = no_inv_value  + (if no_qualifies { trade_size } else { dec!(0.0) });
         let net_exposure  = (projected_yes - projected_no).abs();
 
         if net_exposure > dc.maker_max_exposure_usdc {
+            self.log_gate("net_exposure", &format!(
+                "net_exposure ${:.2} > max ${:.2}",
+                net_exposure, dc.maker_max_exposure_usdc
+            )).await;
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Combined price guard ──────────────────────────────────────────────
         let (final_yes, final_no) = if yes_qualifies && no_qualifies {
             let combined = yes_bid_price + no_bid_price;
-            if combined >= config::MAKER_MAX_COMBINED_BID {
+            if combined >= dc.maker_max_combined_bid {
                 if yes_spread <= no_spread { (None, Some(no_bid_price)) } else { (Some(yes_bid_price), None) }
             } else {
                 (Some(yes_bid_price), Some(no_bid_price))
@@ -255,6 +461,7 @@ impl Strategy for MakerStrategyImpl {
         };
 
         if final_yes.is_none() && final_no.is_none() {
+            self.log_gate("combined_bid", "combined_bid guard suppressed both sides").await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -287,6 +494,19 @@ impl Strategy for MakerStrategyImpl {
             post_only: true,
             ghost_mode: dc.ghost_mode,
         });
+
+        {
+            let mut guard = self.last_quote_log.lock().await;
+            let due = guard.map_or(true, |t| t.elapsed().as_secs() >= config::MAKER_GATE_LOG_INTERVAL_SECS);
+            if due {
+                tracing::info!(
+                    "✅ Maker quoting: YES={} NO={}",
+                    yes_params.as_ref().map(|p| format!("${:.3}", p.price)).unwrap_or_else(|| "—".to_string()),
+                    no_params.as_ref().map(|p| format!("${:.3}", p.price)).unwrap_or_else(|| "—".to_string()),
+                );
+                *guard = Some(Instant::now());
+            }
+        }
 
         Ok(StrategySignal::MakerQuote {
             yes: yes_params,
@@ -338,14 +558,19 @@ impl Strategy for MakerStrategyImpl {
             dc.maker_stop_loss_pct
         };
 
-        // ── Taker-Flow Book-Turn Exit ─────────────────────────────────────────
+        // ── Taker-Flow Book-Turn Exit / Quote-Pull ────────────────────────────
+        // A book that has turned adverse (OBI below the toxic threshold) is a
+        // one-way sweep. For a FILLED position we exit at the bid (ToxicFill). For
+        // an UNFILLED resting quote we cancel it (reactive quote-pull) so it isn't
+        // left on the book to be picked off by the informed flow — the exact
+        // adverse-selection mechanism behind the noon-ET maker losses.
         {
             let pos_map = ctx.positions.lock().await;
+            let mut pull_tokens = Vec::new();
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
                 let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
                     continue;
                 };
-                if position.fill_confirmed_at.is_none() { continue; }
 
                 let (bid_depth, ask_depth, bid) = if token_id == market.yes_token {
                     (snapshot.yes_bid_depth, snapshot.yes_ask_depth, snapshot.yes_bid)
@@ -358,27 +583,41 @@ impl Strategy for MakerStrategyImpl {
                     (bid_depth - ask_depth) / total_depth
                 } else { dec!(0) };
 
-                if obi < config::MAKER_TOXIC_FLOW_EXIT_OBI {
-                    tracing::info!(
-                        "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4}",
-                        obi, config::MAKER_TOXIC_FLOW_EXIT_OBI, bid
-                    );
-                    return Ok(StrategySignal::Exit {
-                        params: OrderParams {
-                            token_id: token_id.clone(),                            price: bid,
-                            shares: position.shares,
-                            fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
-                            is_neg_risk: market.is_neg_risk,
-                            market_name: market.market_name.clone(),
-                            condition_id: market.condition_id.clone(),
-                            order_type: TimeInForce::Fak,
-                            post_only: false,
-                            ghost_mode: dc.ghost_mode,
-                        },
-                        reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
-                        exit_pair: false,
-                    });
+                if obi < dc.maker_toxic_flow_exit_obi {
+                    arm_maker_toxic_cooldown(token_id.as_str());
+                    if position.fill_confirmed_at.is_some() {
+                        tracing::info!(
+                            "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
+                            obi, dc.maker_toxic_flow_exit_obi, bid, dc.maker_toxic_reentry_cooldown_secs
+                        );
+                        return Ok(StrategySignal::Exit {
+                            params: OrderParams {
+                                token_id: token_id.clone(),
+                                price: bid,
+                                shares: position.shares,
+                                fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                                is_neg_risk: market.is_neg_risk,
+                                market_name: market.market_name.clone(),
+                                condition_id: market.condition_id.clone(),
+                                order_type: TimeInForce::Fak,
+                                post_only: false,
+                                ghost_mode: dc.ghost_mode,
+                            },
+                            reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
+                            exit_pair: false,
+                        });
+                    } else {
+                        // Unfilled resting quote sitting in a toxic book → pull it.
+                        pull_tokens.push(token_id.clone());
+                    }
                 }
+            }
+            if !pull_tokens.is_empty() {
+                tracing::info!(
+                    "⚡ Maker quote-pull: cancelling {} unfilled resting quote(s) — book turned toxic (OBI < {:.2}), re-entry locked {}s",
+                    pull_tokens.len(), dc.maker_toxic_flow_exit_obi, dc.maker_toxic_reentry_cooldown_secs
+                );
+                return Ok(StrategySignal::MakerCancel { tokens: pull_tokens });
             }
         }
 
@@ -446,4 +685,41 @@ impl Strategy for MakerStrategyImpl {
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::MAKER_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Net |YES-NO|" }
+}
+
+#[cfg(test)]
+mod toxic_cooldown_tests {
+    use super::{arm_maker_toxic_cooldown, maker_toxic_cooldown_active};
+
+    #[test]
+    fn armed_token_is_locked_out() {
+        let tok = "test_tok_armed_lockout";
+        assert!(!maker_toxic_cooldown_active(tok, 180));
+        arm_maker_toxic_cooldown(tok);
+        assert!(maker_toxic_cooldown_active(tok, 180));
+    }
+
+    #[test]
+    fn unknown_token_is_not_locked() {
+        assert!(!maker_toxic_cooldown_active("test_tok_never_armed", 180));
+    }
+
+    #[test]
+    fn zero_or_negative_cooldown_disables_gate() {
+        let tok = "test_tok_disabled_gate";
+        arm_maker_toxic_cooldown(tok);
+        assert!(!maker_toxic_cooldown_active(tok, 0));
+        assert!(!maker_toxic_cooldown_active(tok, -5));
+    }
+
+    #[test]
+    fn expired_cooldown_allows_reentry() {
+        let tok = "test_tok_expired";
+        arm_maker_toxic_cooldown(tok);
+        // Immediately after arming, a sub-second window has already elapsed
+        // (elapsed secs = 0 is NOT < 0), so the token reads as no-longer-locked
+        // and is pruned on read. Use cooldown_secs so small it is already expired.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!maker_toxic_cooldown_active(tok, 1));
+    }
 }

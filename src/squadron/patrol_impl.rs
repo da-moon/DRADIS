@@ -608,6 +608,7 @@ impl Squadron {
                             cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             oracle_drift_60m: drift_rx.borrow().0,
                             oracle_drift_10m: drift_rx.borrow().1,
+                            hist_vol: drift_rx.borrow().2,
                             secs_to_expiry: hourly_market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
@@ -625,6 +626,7 @@ impl Squadron {
                             no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
                             oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
                             funding_rate: *funding_rx.borrow(), oracle_drift_60m: drift_rx.borrow().0, oracle_drift_10m: drift_rx.borrow().1,
+                            hist_vol: drift_rx.borrow().2,
                             institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
                             tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
                             oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
@@ -1215,7 +1217,7 @@ impl Squadron {
                                                     db::record_open_position_with_status(&pool, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
                                                 }
                                                 tokio::spawn(async move {
-                                                    if sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s).await.is_ok() {
+                                                    if let Ok(true) = sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_a) {
                                                             db::confirm_position_status(&pool, &db_sn_a, &db_tid_a).await;
@@ -1238,7 +1240,7 @@ impl Squadron {
                                                     db::record_open_position_with_status(&pool, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
                                                 }
                                                 tokio::spawn(async move {
-                                                    if sync_position_balance(&cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p).await.is_ok() {
+                                                    if let Ok(true) = sync_position_balance(&cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p, false).await {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_b) {
                                                             db::confirm_position_status(&pool, &db_sn_b, &db_tid_b).await;
@@ -1321,7 +1323,7 @@ impl Squadron {
                                             db::record_open_position_with_status(&pool, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
                                         }
                                         tokio::spawn(async move {
-                                            if sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s).await.is_ok() {
+                                            if let Ok(true) = sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await {
                                                 // Update to confirmed (Mission In-Flight) + record entry
                                                 if let Some(pool) = db::pool_for(&asset_s) {
                                                     db::confirm_position_status(&pool, &db_sn_s, &db_tid_s).await;
@@ -1390,7 +1392,7 @@ impl Squadron {
                                                 db::record_open_position_with_status(&pool, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
                                             }
                                             tokio::spawn(async move {
-                                                if sync_position_balance(&cl_m, &ps_m, &sn_m, &p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW, &to_m).await.is_ok() {
+                                                if let Ok(true) = sync_position_balance(&cl_m, &ps_m, &sn_m, &p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW, &to_m, true).await {
                                                     // Update to confirmed (Mission In-Flight) + record entry
                                                     if let Some(pool) = db::pool_for(&asset_em) {
                                                         db::confirm_position_status(&pool, &sn_m, &tid_em).await;
@@ -1404,6 +1406,33 @@ impl Squadron {
                                 }
                                 if placed { last_trade_time.insert(sn.clone(), Instant::now()); }
                                 if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES { error!("🚨 Circuit breaker hit!"); tokio::time::sleep(Duration::from_secs(60)).await; consecutive_failures = 0; }
+                            }
+                            // ════════════════════ MAKER QUOTE-PULL ════════════════════
+                            // Cancel resting UNFILLED maker quotes whose book turned toxic
+                            // before they filled — pull them off the book so informed flow
+                            // can't pick them off (the noon-ET adverse-selection losses).
+                            StrategySignal::MakerCancel { tokens } => {
+                                for tok in tokens {
+                                    let pk = (sn.clone(), tok.clone());
+                                    // Never touch a CONFIRMED fill — only pull unfilled resting quotes.
+                                    let is_unfilled = {
+                                        let pos = positions.lock().await;
+                                        matches!(pos.get(&pk), Some(p) if p.fill_confirmed_at.is_none())
+                                    };
+                                    if !is_unfilled { continue; }
+                                    if config::GHOST_MODE {
+                                        info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
+                                    } else {
+                                        crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                    }
+                                    positions.lock().await.remove(&pk);
+                                    pending_orders.lock().await.remove(&pk);
+                                    token_ownership.lock().await.remove(&tok);
+                                    if let Some(pool) = db::pool_for(&asset_lc) {
+                                        db::close_open_position(&pool, &sn, tok.as_str()).await;
+                                    }
+                                    info!("🚫 Maker quote-pulled [{}]: {} — resting quote cancelled (book turned toxic)", sn, tok);
+                                }
                             }
                             StrategySignal::NoSignal => {}
                         }
