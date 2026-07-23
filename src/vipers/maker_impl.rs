@@ -178,6 +178,81 @@ fn maker_toxic_cooldown_active(token_id: &str, cooldown_secs: i64) -> bool {
     false
 }
 
+/// Process-global oracle baseline per quoted token: token_id → oracle price at the
+/// moment the quote was (re)placed.  Global for the same rotation-survival reason as
+/// the trackers above.  Used by the oracle-drift quote pull: the oracle is the
+/// LEADING toxicity signal — informed takers act on Binance moves seconds before the
+/// Polymarket book (OBI) reflects them, so an OBI-triggered pull loses the race
+/// (2026-07-16: quote placed 12:56 @ BTC $64,420, BTC broke down ~12:58, OBI pull
+/// fired 13:02:46, taker filled us anyway → −$0.365).  Drift-based pulls cancel the
+/// stale quote minutes earlier.
+fn maker_quote_oracle_baselines() -> &'static std::sync::Mutex<HashMap<String, Decimal>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Decimal>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record the oracle price behind a freshly placed/refreshed quote for `token_id`.
+fn set_maker_quote_oracle_baseline(token_id: &str, oracle: Decimal) {
+    if oracle <= dec!(0) { return; }
+    let mut reg = match maker_quote_oracle_baselines().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.insert(token_id.to_string(), oracle);
+}
+
+/// Clear the baseline once the quote is gone (pulled, filled, or exited).
+fn clear_maker_quote_oracle_baseline(token_id: &str) {
+    let mut reg = match maker_quote_oracle_baselines().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.remove(token_id);
+}
+
+/// Process-global gate-qualification streaks: token_id → the instant that side
+/// FIRST began continuously passing every entry gate.  Global for the usual
+/// rotation-survival reason.  Backs the gate-dwell requirement: a single clean
+/// tick amid book_imbalance/velocity_bias flicker during a directional move is
+/// noise, not a regime change (2026-07-17: gates blocked NO at 12:47:51, one
+/// clean tick at 12:47:55 posted a quote that was lifted within 5s → ToxicFill
+/// −$0.20).  Requiring MAKER_GATE_DWELL_SECS of continuous qualification blocks
+/// quoting into an active move; instant fills on fresh quotes are near-always
+/// adverse selection.
+fn maker_gate_streaks() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Update the qualification streak for `token_id` and return the seconds it has
+/// been continuously qualifying (0 on the first qualifying tick).  A
+/// non-qualifying tick resets the streak and returns None.
+fn maker_gate_streak_secs(token_id: &str, qualifies: bool) -> Option<i64> {
+    let mut reg = match maker_gate_streaks().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !qualifies {
+        reg.remove(token_id);
+        return None;
+    }
+    let started = reg.entry(token_id.to_string()).or_insert_with(Instant::now);
+    Some(started.elapsed().as_secs() as i64)
+}
+
+/// Signed fractional oracle move since the quote baseline for `token_id`
+/// (positive = oracle rose).  None when no baseline exists or oracle is invalid.
+fn maker_quote_oracle_drift(token_id: &str, oracle_now: Decimal) -> Option<Decimal> {
+    if oracle_now <= dec!(0) { return None; }
+    let reg = match maker_quote_oracle_baselines().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.get(token_id).map(|base| (oracle_now - base) / base)
+}
+
 impl MakerStrategyImpl {
     pub fn new() -> Self {
         Self {
@@ -238,6 +313,8 @@ impl Strategy for MakerStrategyImpl {
         // day-old daily maker market each hour.
         let secs_since_market_start = market_age_secs(&market.market_name);
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
+            maker_gate_streak_secs(market.yes_token.as_str(), false);
+            maker_gate_streak_secs(market.no_token.as_str(), false);
             self.log_gate("market_age", &format!(
                 "market_age {}s < min {}s",
                 secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS
@@ -249,6 +326,8 @@ impl Strategy for MakerStrategyImpl {
         if let Some(close_time) = market.market_close_time {
             let secs_to_expiry = (close_time - ctx.wall_now).num_seconds();
             if secs_to_expiry < dc.maker_min_secs_to_expiry {
+                maker_gate_streak_secs(market.yes_token.as_str(), false);
+                maker_gate_streak_secs(market.no_token.as_str(), false);
                 self.log_gate("expiry", &format!(
                     "secs_to_expiry {}s < min {}s",
                     secs_to_expiry, dc.maker_min_secs_to_expiry
@@ -256,6 +335,8 @@ impl Strategy for MakerStrategyImpl {
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
+            maker_gate_streak_secs(market.yes_token.as_str(), false);
+            maker_gate_streak_secs(market.no_token.as_str(), false);
             self.log_gate("no_close_time", "no market_close_time").await;
             return Ok(StrategySignal::NoSignal);
         }
@@ -272,6 +353,8 @@ impl Strategy for MakerStrategyImpl {
             && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= dc.maker_max_book_imbalance_ratio;
 
         if !yes_book_ok && !no_book_ok {
+            maker_gate_streak_secs(market.yes_token.as_str(), false);
+            maker_gate_streak_secs(market.no_token.as_str(), false);
             self.log_gate("book_imbalance", &format!(
                 "book_imbalance both sides (ratio>{:.1}): yes_bidD={:.0} yes_askD={:.0} | no_bidD={:.0} no_askD={:.0}",
                 dc.maker_max_book_imbalance_ratio,
@@ -393,9 +476,38 @@ impl Strategy for MakerStrategyImpl {
         let yes_toxic_cooldown = maker_toxic_cooldown_active(market.yes_token.as_str(), cooldown_secs);
         let no_toxic_cooldown  = maker_toxic_cooldown_active(market.no_token.as_str(), cooldown_secs);
 
-        let yes_qualifies = yes_book_ok
+        // ── Horizon Raptor gate (4th defense layer, observe-first) ───────────
+        // TradFi front-runs BTC when macro_coherence is high, and a VIX-proxy
+        // velocity spike is the earliest panic-onset signal — both LEAD the OBI
+        // flip.  Risk-off flow ⇒ BTC likely down ⇒ suppress YES bids (they'd be
+        // lifted by informed sellers); risk-on ⇒ suppress NO.  A VIX spike
+        // suppresses BOTH sides regardless of coherence (panic is panic).
+        // With MAKER_HORIZON_GATE_ENFORCE=false this only logs "would veto".
+        let hz = &ctx.snapshot;
+        let hz_vix_spike = hz.vix_velocity >= config::MAKER_HORIZON_VIX_VEL_MAX;
+        let hz_coherent  = hz.macro_coherence >= config::MAKER_HORIZON_COHERENCE_MIN;
+        let hz_risk_off  = hz_coherent && hz.tradfi_velocity <= -config::MAKER_HORIZON_TRADFI_VETO;
+        let hz_risk_on   = hz_coherent && hz.tradfi_velocity >=  config::MAKER_HORIZON_TRADFI_VETO;
+        let horizon_blocks_yes = hz_vix_spike || hz_risk_off;
+        let horizon_blocks_no  = hz_vix_spike || hz_risk_on;
+        if horizon_blocks_yes || horizon_blocks_no {
+            self.log_gate("horizon", &format!(
+                "🔭 Horizon gate{}: {}{}{} | tradfi_vel={:.3} coh={:.2} vix_vel={:.3} (blocks: YES={} NO={})",
+                if config::MAKER_HORIZON_GATE_ENFORCE { "" } else { " (observe — would veto)" },
+                if hz_vix_spike { "VIX spike " } else { "" },
+                if hz_risk_off { "risk-off " } else { "" },
+                if hz_risk_on { "risk-on " } else { "" },
+                hz.tradfi_velocity, hz.macro_coherence, hz.vix_velocity,
+                horizon_blocks_yes, horizon_blocks_no,
+            )).await;
+        }
+        let horizon_vetoes_yes = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_yes;
+        let horizon_vetoes_no  = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_no;
+
+        let yes_gates_pass = yes_book_ok
             && !taker_flow_blocks_yes
             && !yes_toxic_cooldown
+            && !horizon_vetoes_yes
             && yes_spread >= dc.maker_min_spread
             && yes_bid_price >= dc.maker_min_entry_price
             && yes_bid_price <= dc.maker_max_entry_price
@@ -403,9 +515,10 @@ impl Strategy for MakerStrategyImpl {
             && no_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_negative;
 
-        let no_qualifies = no_book_ok
+        let no_gates_pass = no_book_ok
             && !taker_flow_blocks_no
             && !no_toxic_cooldown
+            && !horizon_vetoes_no
             && no_spread >= dc.maker_min_spread
             && no_bid_price >= dc.maker_min_entry_price
             && no_bid_price <= dc.maker_max_entry_price
@@ -413,15 +526,31 @@ impl Strategy for MakerStrategyImpl {
             && yes_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_positive;
 
+        // ── Gate-dwell requirement ────────────────────────────────────────────
+        // Gates must pass CONTINUOUSLY for MAKER_GATE_DWELL_SECS before a side may
+        // quote.  A single clean tick amid gate flicker during a directional move
+        // is noise (2026-07-17 instant-fill ToxicFill); any gate failure resets
+        // that side's streak.
+        let yes_streak = maker_gate_streak_secs(market.yes_token.as_str(), yes_gates_pass);
+        let no_streak  = maker_gate_streak_secs(market.no_token.as_str(), no_gates_pass);
+        let yes_qualifies = yes_streak.is_some_and(|s| s >= config::MAKER_GATE_DWELL_SECS);
+        let no_qualifies  = no_streak.is_some_and(|s| s >= config::MAKER_GATE_DWELL_SECS);
+
         if !yes_qualifies && !no_qualifies {
-            let (yes_key, yes_detail) = side_reject_reason(
-                yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown, yes_spread, yes_bid_price,
-                snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
-            ).unwrap_or(("unknown", "unknown".to_string()));
-            let (no_key, no_detail) = side_reject_reason(
-                no_book_ok, taker_flow_blocks_no, no_toxic_cooldown, no_spread, no_bid_price,
-                snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
-            ).unwrap_or(("unknown", "unknown".to_string()));
+            let (yes_key, yes_detail) = match yes_streak {
+                Some(s) => ("gate_dwell", format!("gate_dwell {}s/{}s", s, config::MAKER_GATE_DWELL_SECS)),
+                None => side_reject_reason(
+                    yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown, yes_spread, yes_bid_price,
+                    snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
+                ).unwrap_or(("unknown", "unknown".to_string())),
+            };
+            let (no_key, no_detail) = match no_streak {
+                Some(s) => ("gate_dwell", format!("gate_dwell {}s/{}s", s, config::MAKER_GATE_DWELL_SECS)),
+                None => side_reject_reason(
+                    no_book_ok, taker_flow_blocks_no, no_toxic_cooldown, no_spread, no_bid_price,
+                    snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
+                ).unwrap_or(("unknown", "unknown".to_string())),
+            };
             self.log_gate(
                 &format!("noqual:{}/{}", yes_key, no_key),
                 &format!("no side qualifies | YES: {} | NO: {}", yes_detail, no_detail),
@@ -463,6 +592,33 @@ impl Strategy for MakerStrategyImpl {
         if final_yes.is_none() && final_no.is_none() {
             self.log_gate("combined_bid", "combined_bid guard suppressed both sides").await;
             return Ok(StrategySignal::NoSignal);
+        }
+
+        // Viper Backtrace: stash quote-time decision state per side.  The stash is
+        // keyed by token and only drained when a fill is confirmed (record_entry_signal),
+        // so re-quotes simply overwrite with the latest state — the row captures the
+        // quote that actually filled.
+        if let Some(p) = final_yes {
+            crate::helpers::metrics::stash_entry_signals_json(market.yes_token.as_str(), serde_json::json!({
+                "viper": "Maker",
+                "side": "YES",
+                "quote_bid": p.to_string(),
+                "spread": yes_spread.to_string(),
+                "trade_size": trade_size.to_string(),
+                "net_exposure": net_exposure.to_string(),
+                "both_sides_quoted": final_no.is_some(),
+            }));
+        }
+        if let Some(p) = final_no {
+            crate::helpers::metrics::stash_entry_signals_json(market.no_token.as_str(), serde_json::json!({
+                "viper": "Maker",
+                "side": "NO",
+                "quote_bid": p.to_string(),
+                "spread": no_spread.to_string(),
+                "trade_size": trade_size.to_string(),
+                "net_exposure": net_exposure.to_string(),
+                "both_sides_quoted": final_yes.is_some(),
+            }));
         }
 
         // ── Build detailed signals ───────────────────────────────────────────
@@ -523,9 +679,15 @@ impl Strategy for MakerStrategyImpl {
             .map(|t| (t - ctx.wall_now).num_seconds())
             .unwrap_or(9999);
 
-        // Near-expiry forced exit to avoid binary resolution risk
+        // Near-expiry forced exit to avoid binary resolution risk.
+        //
+        // 2026-07-14: fires at maker_min_secs_to_expiry (1800s) instead of a hardcoded
+        // 900s. Quoting already stops at 1800s, so the old 900s threshold left a
+        // 15-minute dead zone holding pure directional risk with no new quotes — a
+        // YES @ $0.48 rode through it to resolution at $0.004 (−$3.81, the single
+        // largest maker loss). Flatten the moment the strategy stops quoting.
         let profit_threshold = dec!(0.02);
-        if secs_to_expiry < 900 {
+        if secs_to_expiry < dc.maker_min_secs_to_expiry {
             let pos_map = ctx.positions.lock().await;
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
                 if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) {
@@ -564,13 +726,47 @@ impl Strategy for MakerStrategyImpl {
         // an UNFILLED resting quote we cancel it (reactive quote-pull) so it isn't
         // left on the book to be picked off by the informed flow — the exact
         // adverse-selection mechanism behind the noon-ET maker losses.
+        //
+        // ORACLE-DRIFT pull (leading signal): OBI only turns AFTER informed takers
+        // arrive, and the OBI pull loses the cancel race (2026-07-16: pull fired
+        // 13:02:46, taker filled us anyway → −$0.365).  The oracle moves first, so
+        // an unfilled quote whose oracle has drifted adversely beyond
+        // MAKER_ORACLE_DRIFT_PULL_FRAC since placement is cancelled immediately.
         {
             let pos_map = ctx.positions.lock().await;
             let mut pull_tokens = Vec::new();
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
                 let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
+                    // No quote/position on this token — drop any stale drift baseline.
+                    clear_maker_quote_oracle_baseline(token_id.as_str());
                     continue;
                 };
+
+                if position.fill_confirmed_at.is_none() {
+                    // Unfilled resting quote: arm/check the oracle-drift baseline.
+                    let oracle_now = snapshot.oracle_price;
+                    match maker_quote_oracle_drift(token_id.as_str(), oracle_now) {
+                        None => set_maker_quote_oracle_baseline(token_id.as_str(), oracle_now),
+                        Some(drift) => {
+                            // YES bid: oracle falling is adverse. NO bid: oracle rising.
+                            let adverse = if token_id == market.yes_token { -drift } else { drift };
+                            if adverse >= config::MAKER_ORACLE_DRIFT_PULL_FRAC {
+                                arm_maker_toxic_cooldown(token_id.as_str());
+                                clear_maker_quote_oracle_baseline(token_id.as_str());
+                                tracing::info!(
+                                    "⚡ Maker quote-pull (oracle drift): oracle moved {:.3}% adverse to resting {} quote (threshold {:.3}%) — cancelling before the book turns, re-entry locked {}s",
+                                    adverse * dec!(100), if token_id == market.yes_token { "YES" } else { "NO" },
+                                    config::MAKER_ORACLE_DRIFT_PULL_FRAC * dec!(100), dc.maker_toxic_reentry_cooldown_secs
+                                );
+                                pull_tokens.push(token_id.clone());
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    // Quote filled — baseline no longer meaningful.
+                    clear_maker_quote_oracle_baseline(token_id.as_str());
+                }
 
                 let (bid_depth, ask_depth, bid) = if token_id == market.yes_token {
                     (snapshot.yes_bid_depth, snapshot.yes_ask_depth, snapshot.yes_bid)
@@ -585,6 +781,7 @@ impl Strategy for MakerStrategyImpl {
 
                 if obi < dc.maker_toxic_flow_exit_obi {
                     arm_maker_toxic_cooldown(token_id.as_str());
+                    clear_maker_quote_oracle_baseline(token_id.as_str());
                     if position.fill_confirmed_at.is_some() {
                         tracing::info!(
                             "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
@@ -635,6 +832,29 @@ impl Strategy for MakerStrategyImpl {
             let secs_since_fill = position.fill_confirmed_at
                 .map(|t| (ctx.wall_now - t).num_seconds())
                 .unwrap_or(0);
+
+            // Catastrophic floor — ungated by the min-hold and by fill confirmation,
+            // so a fast adverse move during the stop's blind window (or on an adopted
+            // position) is still cut. See MAKER_CATASTROPHIC_SL_MULT.
+            let catastrophic_pct = effective_stop_pct * config::MAKER_CATASTROPHIC_SL_MULT;
+            if profit_pct <= -catastrophic_pct {
+                return Ok(StrategySignal::Exit {
+                    params: OrderParams {
+                        token_id: token_id.clone(),
+                        price: bid,
+                        shares: position.shares,
+                        fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                        is_neg_risk: market.is_neg_risk,
+                        market_name: market.market_name.clone(),
+                        condition_id: market.condition_id.clone(),
+                        order_type: TimeInForce::Fak,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
+                    },
+                    reason: format!("Maker Catastrophic: loss={:.2}% ({}s held)", profit_pct * dec!(100), secs_since_fill),
+                    exit_pair: false,
+                });
+            }
 
             if position.fill_confirmed_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
                 return Ok(StrategySignal::Exit {

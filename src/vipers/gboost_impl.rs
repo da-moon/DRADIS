@@ -3,7 +3,7 @@
 /// Uses the `perpetual` crate's `PerpetualBooster` (LogLoss objective) to predict
 /// near-term YES price direction from a rolling window of orderbook + oracle features.
 ///
-/// ── Feature Vector (NUM_FEATURES = 26) ──────────────────────────────────────
+/// ── Feature Vector (NUM_FEATURES = 30) ──────────────────────────────────────
 ///   [0]  yes_obi         — (yes_bid_depth − yes_ask_depth) / total depth
 ///   [1]  no_obi          — (no_bid_depth − no_ask_depth) / total depth
 ///   [2]  yes_ask         — best ask price for YES token
@@ -56,10 +56,20 @@
 ///                          >0 = positioning building, <0 = de-leveraging/squeeze. All-asset.
 ///  [25]  cvd_ratio        — taker buy÷sell volume ratio. >1 = buy aggression, <1 = sell
 ///                          aggression, 0 = no data (treated neutral). All-asset.
+///  [26]  tradfi_velocity  — Horizon Raptor volume-weighted 5s momentum of SPY+QQQ ($).
+///                          >0 = risk-on front-running, <0 = risk-off. 0 outside US hours.
+///  [27]  macro_coherence  — 10m rolling Pearson correlation of QQQ vs BTC velocity in
+///                          [-1, 1]. High = BTC trading as high-beta tech (TradFi
+///                          features informative); ~0 = decoupled regime.
+///  [28]  vix_proxy        — UVXY last price ÷ 100 (fear/volatility level). The model
+///                          can learn regime interactions (e.g. mean-reversion works
+///                          in low-VIX chop, fails in high-VIX trends).
+///  [29]  vix_velocity     — UVXY 5s rate of change ($). Sharp positive spike = panic
+///                          onset. 0 outside US hours / raptor absent.
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
-///   1.0  if yes_bid rises in GBOOST_LOOKAHEAD_TICKS ticks
-///   0.0  otherwise
+///   1.0  if the oracle (Binance) price is higher GBOOST_LABEL_HORIZON_SECS later
+///   0.0  otherwise (flat-oracle samples below GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC are skipped)
 ///
 /// ── Lifecycle ────────────────────────────────────────────────────────────────
 ///   1. Snapshots are pushed into a fixed-size ring buffer every tick.
@@ -95,7 +105,7 @@ use crate::helpers::price::floor_to_tick_size;
 use crate::venues::core::TimeInForce;
 
 /// Number of f64 features per snapshot row fed into the booster.
-const NUM_FEATURES: usize = 26;
+const NUM_FEATURES: usize = 30;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
@@ -188,10 +198,10 @@ fn tick_momentum_from_slice(snaps: &[MarketSnapshot], idx: usize) -> f64 {
 
 /// Convert a `MarketSnapshot` into a fixed-length `f64` feature array.
 fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vol: f64, tick_momentum: f64) -> [f64; NUM_FEATURES] {
-    // Use obi_from_depths (which returns -1.0 on zero depth) to match the entry gate's
-    // side_obi() convention.  The entry gate blocks zero-depth entries (OBI=-1.0 < adverse
-    // threshold), so training records will also never have zero-depth — but prediction can
-    // receive any snapshot. Aligning the default removes a hidden prediction/gate mismatch.
+    // obi_from_depths returns -1.0 on zero depth as a stable FEATURE convention (the
+    // model needs some numeric value for a zero-depth book).  Note: the entry gates no
+    // longer share this convention — they consume an EMA-smoothed OBI (smoothed_obi())
+    // where zero depth means "unknown" and falls back to the last fresh EMA value.
     let yes_obi = obi_from_depths(s.yes_bid_depth, s.yes_ask_depth);
     let no_obi  = obi_from_depths(s.no_bid_depth,  s.no_ask_depth);
 
@@ -294,6 +304,10 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vo
         s.tide_coherence.to_f64().unwrap_or(0.0),                  // [23] NEW: tide coherence (ETF agreement, 0..1)
         s.oi_delta_pct.to_f64().unwrap_or(0.0),                    // [24] NEW: perp open-interest delta (positioning build/unwind)
         s.cvd_ratio.to_f64().unwrap_or(0.0),                       // [25] NEW: taker buy/sell ratio (aggression; 1.0-centred, 0=no data)
+        s.tradfi_velocity.to_f64().unwrap_or(0.0),                 // [26] NEW: Horizon SPY+QQQ 5s momentum ($; 0 off-hours)
+        s.macro_coherence.to_f64().unwrap_or(0.0),                 // [27] NEW: Horizon QQQ↔BTC 10m correlation [-1,1]
+        s.vix_proxy.to_f64().unwrap_or(0.0)         / 100.0,       // [28] NEW: Horizon UVXY level ÷ 100 (vol regime)
+        s.vix_velocity.to_f64().unwrap_or(0.0),                    // [29] NEW: Horizon UVXY 5s velocity ($; panic onset)
     ]
 }
 
@@ -407,6 +421,10 @@ pub struct GboostStrategyImpl {
     /// observed 2026-07-07).  Unlike retrain_backoff_until this applies to HEALTHY retrains
     /// too, not just degenerate ones.
     last_retrain_at: Arc<StdMutex<Option<Instant>>>,
+    /// Throttle for the once-per-interval INFO status line explaining WHY retrain
+    /// cycles are aborting (cold-start visibility).  Without this the abort paths
+    /// are silent (debug-only) and a stalled bootstrap is invisible in prod logs.
+    last_retrain_status_log: Arc<StdMutex<Option<Instant>>>,
     /// When set, records the `Instant` at which BTC spot first dropped below
     /// (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER).  Resets to None whenever spot
     /// recovers above the threshold.  Used to suppress YES entries on daily markets when
@@ -445,30 +463,89 @@ pub struct GboostStrategyImpl {
     /// eval loop never floods. This reveals why GBoost isn't trading despite the
     /// model being confident.
     last_veto_log_at: Arc<StdMutex<Option<Instant>>>,
+    /// EMA state for the OBI quality gates, one slot per (venue, side) — see
+    /// OBI_SLOT_* constants. Each slot stores (ema_value, last_update_instant).
+    /// Smoothing rationale: instantaneous OBI on thin books is quote-flicker noise
+    /// (observed ±0.9 swings minute-to-minute on 2026-07-14, vetoing every eligible
+    /// signal); the EMA captures the persistent book lean the gates are meant to read.
+    obi_ema: Arc<StdMutex<[Option<(f64, Instant)>; 4]>>,
+}
+
+/// ── Process-global GBoost state (survives market rotations) ─────────────────
+/// The patrol loop rebuilds all strategy objects on every hourly market rotation
+/// (`create_all_strategies()`), which used to wipe the snapshot history, the real
+/// trade-outcome buffer, and the trained model — GBoost restarted its bootstrap
+/// from zero every hour.  In a flat regime the ~18-min history window can never
+/// produce GBOOST_MIN_TRAINING_SAMPLES deadband-surviving labels on its own, so
+/// the model NEVER trained (observed 2026-07-16: 17.5h of retrain triggers, zero
+/// trains).  These globals follow the same pattern as maker_market_first_seen().
+/// One crypto per process is already assumed (CRYPTO_FILTER namespaces the model
+/// file), so a single global per state item is safe.
+fn gboost_shared_model() -> Arc<StdMutex<Option<PerpetualBooster>>> {
+    static REG: std::sync::OnceLock<Arc<StdMutex<Option<PerpetualBooster>>>> =
+        std::sync::OnceLock::new();
+    Arc::clone(REG.get_or_init(|| Arc::new(StdMutex::new(None))))
+}
+
+fn gboost_shared_history() -> Arc<StdMutex<VecDeque<MarketSnapshot>>> {
+    static REG: std::sync::OnceLock<Arc<StdMutex<VecDeque<MarketSnapshot>>>> =
+        std::sync::OnceLock::new();
+    Arc::clone(REG.get_or_init(|| {
+        Arc::new(StdMutex::new(VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE + 16)))
+    }))
+}
+
+fn gboost_shared_training_data() -> Arc<StdMutex<VecDeque<TrainingSample>>> {
+    static REG: std::sync::OnceLock<Arc<StdMutex<VecDeque<TrainingSample>>>> =
+        std::sync::OnceLock::new();
+    Arc::clone(REG.get_or_init(|| {
+        Arc::new(StdMutex::new(VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE)))
+    }))
+}
+
+/// Cumulative lookahead-label pool: (labeled samples, timestamp of the last
+/// history snapshot already harvested).  Each retrain cycle labels only NEW
+/// snapshots (timestamp > last-harvest) and appends the deadband survivors here,
+/// so informative samples ACCUMULATE across hours and rotations instead of having
+/// to all come from one 18-min window.  Flat nights fill slowly, volatile hours
+/// fill fast; FIFO-capped at GBOOST_LABEL_POOL_CAP so stale regimes age out.
+fn gboost_label_pool()
+    -> &'static StdMutex<(VecDeque<TrainingSample>, Option<chrono::DateTime<chrono::Utc>>)>
+{
+    static REG: std::sync::OnceLock<
+        StdMutex<(VecDeque<TrainingSample>, Option<chrono::DateTime<chrono::Utc>>)>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| StdMutex::new((VecDeque::new(), None)))
 }
 
 impl GboostStrategyImpl {
     pub fn new() -> Self {
-        let model_arc = Arc::new(StdMutex::new(None::<PerpetualBooster>));
+        // Rotation-surviving model handle. Only hit the disk when no model is in
+        // memory yet (process start) — reloading on every rotation could clobber a
+        // freshly trained in-memory model with an older disk copy.
+        let model_arc = gboost_shared_model();
+        let need_disk_load = model_arc.lock().unwrap().is_none();
 
         // Warm-start: try to load a previously persisted model from disk.
         //
-        // The model path is version-locked to the current feature set (NUM_FEATURES = 26).
+        // The model path is version-locked to the current feature set (NUM_FEATURES = 30).
         // NEVER load a model from a different version — the feature dimensions won't match.
         // History: v14f (14 features) → v19f (added yes_mid_change, no_obi_change,
         // relative_depth_ratio, combined_ask_spread, oracle_drift_10m in May 2026) →
         // v22f (added spread_velocity, hist_vol_regime, tick_momentum in May 2026) →
         // v24f (added institutional_pulse, tide_coherence in Jun 2026) →
-        // v26f (added oi_delta_pct, cvd_ratio in Jun 2026).
+        // v26f (added oi_delta_pct, cvd_ratio in Jun 2026) →
+        // v30g (added Horizon tradfi_velocity, macro_coherence, vix_proxy, vix_velocity
+        // in Jul 2026; zero off-US-hours so the model learns session-dependent splits).
         //
         // Override the path at runtime via the GBOOST_MODEL_PATH env var, e.g.:
         //   GBOOST_MODEL_PATH=/path/to/gboost_model_v19f.json cargo run
         // This is the recommended way to seed a local instance with a model trained on prod.
         // When not overridden the path is namespaced by CRYPTO_FILTER so that each
         // container in a shared-volume multi-instance deploy writes its own file:
-        //   logs/btc-gboost_model_v26f.json, logs/eth-gboost_model_v26f.json, etc.
+        //   logs/btc-gboost_model_v30g.json, logs/eth-gboost_model_v30g.json, etc.
         let model_clone = Arc::clone(&model_arc);
-        tokio::spawn(async move {
+        if need_disk_load { tokio::spawn(async move {
             // Env var takes precedence; fall back to CRYPTO_FILTER-namespaced default.
             let model_path = std::env::var("GBOOST_MODEL_PATH")
                 .unwrap_or_else(|_| {
@@ -511,23 +588,20 @@ impl GboostStrategyImpl {
                     model_path
                 ),
             }
-        });
+        }); }
 
         Self {
             model: model_arc,
-            history: Arc::new(StdMutex::new(
-                VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE + 16)
-            )),
+            history: gboost_shared_history(),
             ticks_since_retrain: Arc::new(StdMutex::new(0)),
             is_training: Arc::new(AtomicBool::new(false)),
-            training_data: Arc::new(StdMutex::new(
-                VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE)
-            )),
+            training_data: gboost_shared_training_data(),
             pending_entries: Arc::new(StdMutex::new(HashMap::new())),
             post_exit_cooldowns: Arc::new(StdMutex::new(HashMap::new())),
             consecutive_degenerate: Arc::new(StdMutex::new(0)),
             retrain_backoff_until: Arc::new(StdMutex::new(None)),
             last_retrain_at: Arc::new(StdMutex::new(None)),
+            last_retrain_status_log: Arc::new(StdMutex::new(None)),
             below_strike_since: Arc::new(StdMutex::new(None)),
             concept_drift_suppressed: Arc::new(AtomicBool::new(false)),
             last_concept_drift_score: Arc::new(StdMutex::new(0.0_f32)),
@@ -536,12 +610,34 @@ impl GboostStrategyImpl {
             market_hold_locks: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             last_pred_log_at: Arc::new(StdMutex::new(None)),
             last_veto_log_at: Arc::new(StdMutex::new(None)),
+            obi_ema: Arc::new(StdMutex::new([None; 4])),
         }
     }
 
+    /// Test-only constructor: replaces the process-global shared state (model,
+    /// history, training_data) with fresh isolated instances so parallel tests
+    /// don't observe each other's samples through the rotation-surviving globals.
+    #[cfg(test)]
+    fn new_isolated() -> Self {
+        let mut s = Self::new();
+        s.model = Arc::new(StdMutex::new(None));
+        s.history = Arc::new(StdMutex::new(VecDeque::new()));
+        s.training_data = Arc::new(StdMutex::new(VecDeque::new()));
+        s
+    }
+
     /// Push snapshot into the ring buffer, evicting the oldest entry when at capacity.
+    /// Time-decimated: snapshots arriving less than GBOOST_HISTORY_MIN_SPACING_MS after
+    /// the previous accepted snapshot are dropped, so the buffer spans wall-clock time
+    /// (~18 min at 500ms spacing) instead of ~110s of near-duplicate 50ms ticks.
     fn push_snapshot(&self, snap: MarketSnapshot) {
         let mut h = self.history.lock().unwrap();
+        if let Some(last) = h.back() {
+            let spacing_ms = (snap.timestamp - last.timestamp).num_milliseconds();
+            if spacing_ms < config::GBOOST_HISTORY_MIN_SPACING_MS {
+                return;
+            }
+        }
         h.push_back(snap);
         if h.len() > config::GBOOST_HISTORY_BUFFER_SIZE {
             h.pop_front();
@@ -554,7 +650,7 @@ impl GboostStrategyImpl {
     /// Label sourcing priority:
     ///   1. Real trade outcomes stored in `training_data` (highest quality — actual P&L).
     ///   2. Lookahead labels from the `history` ring buffer when `training_data` is too
-    ///      sparse.  Label: yes_bid rises within GBOOST_LOOKAHEAD_TICKS ticks → 1.0.
+    ///      sparse.  Label: oracle price higher GBOOST_LABEL_HORIZON_SECS later → 1.0.
     ///      This breaks the chicken-and-egg deadlock that prevents the model from ever
     ///      reaching the minimum sample count required to produce its first predictions.
     fn maybe_retrain(&self, now: Instant) {
@@ -601,6 +697,24 @@ impl GboostStrategyImpl {
         };
         if !triggered { return; }
 
+        // Watchdog breadcrumb: the retrain trigger's SYNCHRONOUS section (sample
+        // collection + drift-window capture) runs on the loop thread and acquires the
+        // std::sync locks (training_data, history) that the eval path also takes — the
+        // exact contention the OS watchdog comment names. Mark it distinctly so a stall
+        // here reports GBOOST_RETRAIN rather than the generic SIGNAL_EVAL/gboost.
+        crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::GboostRetrain);
+        tracing::debug!(" GboostStrategy: retrain trigger fired — collecting samples (sync section)");
+
+        // Throttled INFO status (once per 10 min): abort paths below are otherwise
+        // silent/debug-only, which made a 17h cold-start stall invisible in prod logs.
+        let status = |msg: String| {
+            let mut guard = self.last_retrain_status_log.lock().unwrap();
+            if guard.map_or(true, |t| t.elapsed().as_secs() >= 600) {
+                tracing::info!(" GboostStrategy: retrain waiting — {}", msg);
+                *guard = Some(Instant::now());
+            }
+        };
+
         // ── Collect real trade outcomes (Source 1: highest quality labels) ──────────
         // These are actual entry/exit P&L labels — far more informative than lookahead
         // proxies.  Always collected first; they are prepended to the training batch so
@@ -614,39 +728,87 @@ impl GboostStrategyImpl {
             // Enough real trade outcomes — use them exclusively for the cleanest signal.
             real_samples
         } else {
-            // ── Source 2 (+ Source 1 blend): lookahead labels from history ring buffer ──
+            // ── Source 2 (+ Source 1 blend): lookahead labels via the global pool ──────
             // When real outcomes exist but are too few, prepend them to the lookahead batch.
-            // This breaks the chicken-and-egg bootstrap deadlock while continuously
-            // improving model quality as real trade-outcome labels accumulate.
-            // Label = 1.0 if the YES bid rises within GBOOST_LOOKAHEAD_TICKS ticks.
+            // Label = 1.0 if the ORACLE price is higher GBOOST_LABEL_HORIZON_SECS later.
+            // The market resolves on the oracle, so this is the actual prediction target —
+            // the previous yes_bid-based label learned thin-book quote noise instead
+            // (2026-07-14: model called DOWN 14/17 times while BTC rose +1.7%).
+            //
+            // Harvest is INCREMENTAL: each cycle labels only snapshots newer than the
+            // pool's last-harvest watermark, and deadband survivors accumulate in the
+            // process-global pool (see gboost_label_pool) across cycles and rotations.
             let h = self.history.lock().unwrap();
             let n = h.len();
-            let lookahead = config::GBOOST_LOOKAHEAD_TICKS;
-            // After blending, we need at least (MIN - real_count) lookahead samples plus
-            // the lookahead window itself.  Without real samples this collapses to the
-            // original MIN_TRAINING_SAMPLES + lookahead check.
-            let needed = config::GBOOST_MIN_TRAINING_SAMPLES.saturating_sub(real_samples.len());
-            if n < needed + lookahead {
-                return; // Not enough history yet, wait for more ticks
-            }
-            let usable = n - lookahead;
-            let mut combined = real_samples; // Real outcomes first (highest quality)
-            combined.extend((0..usable).map(|i| {
-                let snap      = &h[i];
-                let prev_snap = if i > 0 { Some(&h[i-1]) } else { None };
-                let future    = &h[i + lookahead];
+            let horizon = chrono::Duration::seconds(config::GBOOST_LABEL_HORIZON_SECS);
+            let mut pool_guard = gboost_label_pool().lock().unwrap();
+            let (pool, last_harvest_ts) = &mut *pool_guard;
+            // `usable` = number of leading samples whose label horizon is fully inside
+            // the buffer (a future snapshot ≥ horizon later exists for them).
+            let usable = match (h.front(), h.back()) {
+                (Some(first), Some(last)) if last.timestamp - first.timestamp >= horizon => {
+                    h.iter().take_while(|s| last.timestamp - s.timestamp >= horizon).count()
+                }
+                _ => 0,
+            };
+            // Two-pointer scan: `j` tracks the first snapshot ≥ horizon after `i`.
+            // Both indices only move forward, so the whole pass is O(n).
+            let mut j = 0usize;
+            for i in 0..usable {
+                let snap = &h[i];
+                // Already harvested by a previous cycle — never relabel a snapshot.
+                if last_harvest_ts.map_or(false, |ts| snap.timestamp <= ts) {
+                    continue;
+                }
+                while j < n && h[j].timestamp - snap.timestamp < horizon {
+                    j += 1;
+                }
+                if j >= n {
+                    break; // No future snapshot far enough ahead (shouldn't happen within `usable`)
+                }
+                let future = &h[j];
+                // Mark processed regardless of whether the deadband keeps it below.
+                *last_harvest_ts = Some(snap.timestamp);
+                let cur = snap.oracle_price.to_f64().unwrap_or(0.0);
+                let fut = future.oracle_price.to_f64().unwrap_or(0.0);
+                // Skip directionally-uninformative samples: oracle essentially flat
+                // (or missing) over the horizon. Force-labelling these 0 teaches the
+                // model that "flat" equals "down".
+                if cur <= 0.0 || fut <= 0.0
+                    || ((fut - cur).abs() / cur) < config::GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC
+                {
+                    continue;
+                }
+                let prev_snap = if i > 0 { Some(&h[i - 1]) } else { None };
                 let hv = hist_vol_from_deque(&h, i);
                 let tm = tick_momentum_from_deque(&h, i);
-                TrainingSample {
+                pool.push_back(TrainingSample {
                     features: extract_features(snap, prev_snap, hv, tm),
-                    is_profitable: future.yes_bid > snap.yes_bid,
+                    is_profitable: fut > cur,
                     entry_timestamp: snap.timestamp,
+                });
+                if pool.len() > config::GBOOST_LABEL_POOL_CAP {
+                    pool.pop_front(); // FIFO: stale regimes age out
                 }
-            }));
+            }
+            let mut combined = real_samples; // Real outcomes first (highest quality)
+            combined.extend(pool.iter().cloned());
             combined
         };
 
-        if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES { return; }
+        if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES {
+            // Re-arm the tick counter so the trigger fires again after a full
+            // GBOOST_RETRAIN_EVERY_N cycle instead of on every 50ms tick.  The pool
+            // accumulates across cycles, so this state always progresses toward a train.
+            status(format!(
+                "label pool filling ({} of {} — {} real outcomes; flat regimes fill slowly)",
+                training_samples.len(), config::GBOOST_MIN_TRAINING_SAMPLES, {
+                    let td = self.training_data.lock().unwrap(); td.len()
+                }
+            ));
+            *self.ticks_since_retrain.lock().unwrap() = 0;
+            return;
+        }
 
         // ── Label-balance guard ───────────────────────────────────────────────
         // In a strongly trending market the lookahead window is nearly all-1 or
@@ -662,6 +824,12 @@ impl GboostStrategyImpl {
                 " GBoost: skipping retrain — labels imbalanced ({:.0}% positive > max {:.0}%), waiting for balanced data",
                 pos_fraction * 100.0, config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX * 100.0
             );
+            status(format!(
+                "labels imbalanced ({:.0}% positive, allowed {:.0}–{:.0}%) — one-sided drift over the horizon",
+                pos_fraction * 100.0,
+                (1.0 - config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX) * 100.0,
+                config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX * 100.0
+            ));
             *self.ticks_since_retrain.lock().unwrap() = 0;
             *self.last_retrain_at.lock().unwrap() = Some(Instant::now());
             return;
@@ -670,6 +838,10 @@ impl GboostStrategyImpl {
         *self.ticks_since_retrain.lock().unwrap() = 0;
         *self.last_retrain_at.lock().unwrap() = Some(Instant::now());
         self.is_training.store(true, Ordering::Relaxed);
+        tracing::info!(
+            " GboostStrategy: retraining model — {} samples ({} real outcomes, {:.0}% positive labels)",
+            training_samples.len(), pos_count, pos_fraction * 100.0
+        );
 
         let model_arc   = Arc::clone(&self.model);
         let is_training = Arc::clone(&self.is_training);
@@ -698,26 +870,16 @@ impl GboostStrategyImpl {
             match result {
                 Ok(Ok((new_model, drift_score))) => {
                     let n = new_model.trees.len();
-                    // Persist to disk first so a crash doesn't lose the trained weights.
-                    // Use the same path resolution as startup load (env var override first,
-                    // then CRYPTO_FILTER-namespaced default so containers don't stomp each other).
-                    if let Ok(json) = new_model.json_dump() {
-                        let model_path = std::env::var("GBOOST_MODEL_PATH")
-                            .unwrap_or_else(|_| {
-                                let crypto = std::env::var("CRYPTO_FILTER")
-                                    .unwrap_or_else(|_| "btc".to_string())
-                                    .to_lowercase();
-                                format!("logs/{}-{}", crypto, config::GBOOST_MODEL_FILENAME)
-                            });
-                        if let Err(e) = tokio::fs::write(&model_path, &json).await {
-                            tracing::warn!(" GboostStrategy: model save failed [{}]: {}", model_path, e);
-                        }
-                    }
-
-                    // Reject degenerate models — a model with fewer than
-                    // GBOOST_MIN_USABLE_TREES trees is essentially a random stump.
+                    // Reject degenerate models BEFORE persisting — a model with fewer
+                    // than GBOOST_MIN_USABLE_TREES trees is essentially a random stump.
                     // Keep the previous (better) model rather than regressing.
                     // Apply exponential backoff so we don't storm every 10 seconds.
+                    //
+                    // 2026-07-18/19: the save used to happen first ("crash safety"),
+                    // which let a quiet-market 16-tree stump OVERWRITE the good model
+                    // on disk; it was then rejected in memory, and the next deploy
+                    // cold-started with nothing loadable — GBoost was blind for 21h.
+                    // Only accepted models may touch the disk file.
                     if n < config::GBOOST_MIN_USABLE_TREES {
                         let mut count = consecutive_degenerate.lock().unwrap();
                         *count += 1;
@@ -738,6 +900,23 @@ impl GboostStrategyImpl {
                     // Good model — reset degenerate backoff counters.
                     *consecutive_degenerate.lock().unwrap() = 0;
                     *retrain_backoff_until.lock().unwrap() = None;
+
+                    // Persist the ACCEPTED model to disk so a crash/redeploy doesn't
+                    // lose the trained weights.  Same path resolution as startup load
+                    // (env var override first, then CRYPTO_FILTER-namespaced default
+                    // so containers don't stomp each other).
+                    if let Ok(json) = new_model.json_dump() {
+                        let model_path = std::env::var("GBOOST_MODEL_PATH")
+                            .unwrap_or_else(|_| {
+                                let crypto = std::env::var("CRYPTO_FILTER")
+                                    .unwrap_or_else(|_| "btc".to_string())
+                                    .to_lowercase();
+                                format!("logs/{}-{}", crypto, config::GBOOST_MODEL_FILENAME)
+                            });
+                        if let Err(e) = tokio::fs::write(&model_path, &json).await {
+                            tracing::warn!(" GboostStrategy: model save failed [{}]: {}", model_path, e);
+                        }
+                    }
 
                     // ── Concept drift monitoring ──────────────────────────────
                     // Compare how live data flows through the new model's split points
@@ -913,7 +1092,9 @@ impl GboostStrategyImpl {
     /// so we conservatively block the entry rather than silently allowing it.
     /// "Ghost OBI" entries (zero depth at evaluation but adverse at heartbeat time)
     /// were responsible for losing trades in the 2026-05-07 afternoon session.
-    fn side_obi(is_yes_side: bool, s: &MarketSnapshot) -> rust_decimal::Decimal {
+    /// Raw one-sided OBI in [-1, 1] for a snapshot, or `None` when the book reports
+    /// zero total depth (no data — NOT the same thing as an adverse book).
+    fn side_obi(is_yes_side: bool, s: &MarketSnapshot) -> Option<rust_decimal::Decimal> {
         let (bid, ask) = if is_yes_side {
             (s.yes_bid_depth, s.yes_ask_depth)
         } else {
@@ -921,12 +1102,54 @@ impl GboostStrategyImpl {
         };
         let total = bid + ask;
         if total > dec!(0) {
-            (bid - ask) / total
+            Some((bid - ask) / total)
         } else {
-            dec!(-1.0) // no depth data → treat as maximally adverse → block entry
+            None
+        }
+    }
+
+    /// Update and read the EMA-smoothed OBI for one of the four gate slots
+    /// (OBI_SLOT_*). Instantaneous OBI on these thin books whipsaws ±0.9 minute to
+    /// minute, so the gates consume a GBOOST_OBI_EMA_TAU_SECS exponential moving
+    /// average instead — cadence-independent via alpha = 1 − exp(−dt/τ).
+    ///
+    /// `raw == None` (zero-depth book): the previous EMA is returned as-is when it is
+    /// fresher than GBOOST_OBI_EMA_STALE_SECS; otherwise `None` (caller vetoes).
+    fn smoothed_obi(&self, slot: usize, raw: Option<rust_decimal::Decimal>) -> Option<rust_decimal::Decimal> {
+        let now = Instant::now();
+        let mut slots = self.obi_ema.lock().unwrap();
+        let entry = &mut slots[slot];
+        match raw {
+            Some(r) => {
+                let r = r.to_f64().unwrap_or(0.0);
+                let ema = match *entry {
+                    Some((prev, last_at)) => {
+                        let dt = now.duration_since(last_at).as_secs_f64();
+                        let alpha = 1.0 - (-dt / config::GBOOST_OBI_EMA_TAU_SECS).exp();
+                        prev + alpha * (r - prev)
+                    }
+                    None => r,
+                };
+                *entry = Some((ema, now));
+                rust_decimal::Decimal::from_f64_retain(ema)
+            }
+            None => match *entry {
+                Some((prev, last_at))
+                    if now.duration_since(last_at).as_secs_f64() <= config::GBOOST_OBI_EMA_STALE_SECS =>
+                {
+                    rust_decimal::Decimal::from_f64_retain(prev)
+                }
+                _ => None,
+            },
         }
     }
 }
+
+/// Slot indices into `GboostStrategyImpl::obi_ema`.
+const OBI_SLOT_TARGET_YES: usize = 0;
+const OBI_SLOT_TARGET_NO:  usize = 1;
+const OBI_SLOT_HOURLY_YES: usize = 2;
+const OBI_SLOT_HOURLY_NO:  usize = 3;
 
 // ── Position-sizing helpers ───────────────────────────────────────────────────
 
@@ -1190,6 +1413,21 @@ impl Strategy for GboostStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── OBI EMA update (every evaluated tick) ────────────────────────────
+        // Feed the smoothed-OBI slots on every tick that reaches evaluation so the
+        // EMA tracks the book continuously — not just at the moment a gate fires.
+        // The quality gates below consume these smoothed values.
+        let smoothed_target_yes_obi = self.smoothed_obi(OBI_SLOT_TARGET_YES, Self::side_obi(true, target_snapshot));
+        let smoothed_target_no_obi  = self.smoothed_obi(OBI_SLOT_TARGET_NO,  Self::side_obi(false, target_snapshot));
+        let (smoothed_hourly_yes_obi, smoothed_hourly_no_obi) = if ctx.maker_snapshot.is_some() {
+            (
+                self.smoothed_obi(OBI_SLOT_HOURLY_YES, Self::side_obi(true, &ctx.snapshot)),
+                self.smoothed_obi(OBI_SLOT_HOURLY_NO,  Self::side_obi(false, &ctx.snapshot)),
+            )
+        } else {
+            (None, None)
+        };
+
         let p_yes_up = match self.predict(predict_snapshot) {
             Some(p) => p,
             None    => return Ok(StrategySignal::NoSignal),
@@ -1336,7 +1574,7 @@ impl Strategy for GboostStrategyImpl {
         if p_yes_up >= entry_thresh && !has_yes {
             // Trend-alignment: block YES entries in a downtrend
             if drift_60m < -trend_block {
-                veto!("counter-trend");
+                veto!(format!("counter-trend (drift_60m=${:.0} < -${:.0})", drift_60m, trend_block));
             }
             // Strike-distance: block YES entries when BTC has been below (strike−buffer) for 60+ min
             if below_strike_suppressed_for_yes {
@@ -1367,16 +1605,21 @@ impl Strategy for GboostStrategyImpl {
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token.clone(), ctx.wall_now) {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
-            let yes_obi = Self::side_obi(true, target_snapshot);
+            // Smoothed (EMA) OBI — see smoothed_obi(). None = zero-depth book with no
+            // fresh EMA to fall back on: the book state is unknown, so don't trade it.
+            if smoothed_target_yes_obi.is_none() {
+                veto!("no OBI depth data");
+            }
+            let yes_obi = smoothed_target_yes_obi.unwrap();
             if yes_obi < dc.gboost_obi_adverse_block {
-                veto!("adverse OBI");
+                veto!(format!("adverse OBI (yes_obi={:.2} < {:.2})", yes_obi, dc.gboost_obi_adverse_block));
             }
             // ── OBI exhaustion gate ───────────────────────────────────────────
             // When |obi| is very large the move is already mature — entering YES
             // into an already-resolved book is tail-chasing with maximum adverse
             // selection. 2026-05-08 T2: |obi_y|=0.61 on a ~93% YES market → SL -$0.457.
             if yes_obi.abs() > dc.gboost_obi_exhaustion_block {
-                veto!("OBI exhaustion");
+                veto!(format!("OBI exhaustion (|yes_obi|={:.2} > {:.2})", yes_obi.abs(), dc.gboost_obi_exhaustion_block));
             }
             // ── Hourly OBI direction check for daily entries ──────────────────
             // When trading daily market, the hourly YES OBI foreshadows daily direction.
@@ -1384,9 +1627,12 @@ impl Strategy for GboostStrategyImpl {
             // fading a pump — entering daily YES contradicts the hourly signal.
             // 2026-05-07 afternoon: blocked entries where hourly OBI was -0.81 to -0.88.
             if ctx.maker_snapshot.is_some() {
-                let hourly_yes_obi = Self::side_obi(true, &ctx.snapshot);
+                if smoothed_hourly_yes_obi.is_none() {
+                    veto!("no hourly OBI depth data");
+                }
+                let hourly_yes_obi = smoothed_hourly_yes_obi.unwrap();
                 if hourly_yes_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
-                    veto!("hourly YES OBI adverse");
+                    veto!(format!("hourly YES OBI adverse ({:.2} < {:.2})", hourly_yes_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK));
                 }
                 // ── Hourly OBI exhaustion check ───────────────────────────────
                 // When the hourly book is overwhelmingly bid-dominated (OBI > +threshold)
@@ -1396,7 +1642,7 @@ impl Strategy for GboostStrategyImpl {
                 // 2026-05-24 11:39: hourly YES OBI=0.85 at entry → price fell from $0.54
                 // to $0.49 in 45 s (-$0.26 loss).  Blocked at OBI_EXHAUSTION_BLOCK=0.80.
                 if hourly_yes_obi.abs() > dc.gboost_obi_exhaustion_block {
-                    veto!("hourly OBI exhausted");
+                    veto!(format!("hourly OBI exhausted (|{:.2}| > {:.2})", hourly_yes_obi, dc.gboost_obi_exhaustion_block));
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.yes_ask);
@@ -1404,14 +1650,14 @@ impl Strategy for GboostStrategyImpl {
                 || price < dc.gboost_min_entry_price
                 || price <= dec!(0)
             {
-                veto!("YES price out of range");
+                veto!(format!("YES price out of range (ask=${:.2}, allowed ${:.2}–${:.2})", price, dc.gboost_min_entry_price, dc.gboost_max_yes_entry_price));
             }
             // ── 50-cent coin-flip zone gate ───────────────────────────────────
             // Near 0.50 the market is directionally undecided. With 10% round-trip
             // taker fees, GBoost needs > 10% price move to break even — impossible
             // in a 50/50 coin flip. Require minimum edge distance from fair value.
             if (price - dec!(0.50)).abs() < dc.gboost_min_edge_from_fair {
-                veto!("price too close to 0.50");
+                veto!(format!("price too close to 0.50 (ask=${:.2}, min edge {:.2})", price, dc.gboost_min_edge_from_fair));
             }
             // Confidence-proportional sizing: more capital for higher-conviction signals.
             // Volatility-scaled: reduce size when oracle hist_vol_regime is elevated.
@@ -1431,7 +1677,7 @@ impl Strategy for GboostStrategyImpl {
                 let estimated_fee  = trade_usdc * fee_roundtrip;
                 let net_expected   = expected_gross - estimated_fee;
                 if net_expected < dc.gboost_min_net_profit_usdc {
-                    veto!("net profit too low");
+                    veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
             }
             let shares = trade_usdc / price;
@@ -1445,6 +1691,17 @@ impl Strategy for GboostStrategyImpl {
                 target_market.yes_token.clone(),
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
+            // Viper Backtrace: persist the model/decision state for this entry.
+            crate::helpers::metrics::stash_entry_signals_json(target_market.yes_token.as_str(), serde_json::json!({
+                "viper": "GBoost",
+                "side": "YES",
+                "p_yes_up": p_yes_up,
+                "entry_thresh": entry_thresh,
+                "entry_price": price.to_string(),
+                "trade_usdc": trade_usdc.to_string(),
+                "hist_vol": precomp_hist_vol,
+                "tick_momentum": precomp_tick_momentum,
+            }));
             // Record market-level hold lock to prevent rapid flip chop.
             self.market_hold_locks.lock().unwrap()
                 .insert(target_market.condition_id.clone(), ctx.mono_now);
@@ -1468,7 +1725,7 @@ impl Strategy for GboostStrategyImpl {
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
             // Trend-alignment: block NO entries in an uptrend
             if drift_60m > trend_block {
-                veto!("counter-trend");
+                veto!(format!("counter-trend (drift_60m=+${:.0} > ${:.0})", drift_60m, trend_block));
             }
             // ── Market-level holding lock ─────────────────────────────────────
             {
@@ -1487,15 +1744,19 @@ impl Strategy for GboostStrategyImpl {
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token.clone(), ctx.wall_now) {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
-            let no_obi = Self::side_obi(false, target_snapshot);
+            // Smoothed (EMA) OBI — see smoothed_obi(). None = unknown book state.
+            if smoothed_target_no_obi.is_none() {
+                veto!("no OBI depth data");
+            }
+            let no_obi = smoothed_target_no_obi.unwrap();
             if no_obi < dc.gboost_obi_adverse_block {
-                veto!("adverse OBI");
+                veto!(format!("adverse OBI (no_obi={:.2} < {:.2})", no_obi, dc.gboost_obi_adverse_block));
             }
             // ── OBI exhaustion gate ───────────────────────────────────────────
             // Blocks NO entries where the book is already heavily one-sided against
             // the NO leg — the move is in progress and the risk/reward is exhausted.
             if no_obi.abs() > dc.gboost_obi_exhaustion_block {
-                veto!("OBI exhaustion");
+                veto!(format!("OBI exhaustion (|no_obi|={:.2} > {:.2})", no_obi.abs(), dc.gboost_obi_exhaustion_block));
             }
             // ── Hourly OBI direction check for daily entries ──────────────────
             // When trading daily market, the hourly NO OBI reveals whether smart money
@@ -1505,9 +1766,12 @@ impl Strategy for GboostStrategyImpl {
             // 2026-05-07 trade 2: hourly NO OBI = -0.88 → blocked (saved $0.30).
             // 2026-05-07 trade 9: hourly NO OBI = -0.81 → blocked (saved $0.30).
             if ctx.maker_snapshot.is_some() {
-                let hourly_no_obi = Self::side_obi(false, &ctx.snapshot);
+                if smoothed_hourly_no_obi.is_none() {
+                    veto!("no hourly OBI depth data");
+                }
+                let hourly_no_obi = smoothed_hourly_no_obi.unwrap();
                 if hourly_no_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
-                    veto!("hourly NO OBI adverse");
+                    veto!(format!("hourly NO OBI adverse ({:.2} < {:.2})", hourly_no_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK));
                 }
                 // ── Hourly OBI exhaustion check ───────────────────────────────
                 // Mirrors the YES exhaustion check: when hourly NO book is overwhelmingly
@@ -1515,7 +1779,7 @@ impl Strategy for GboostStrategyImpl {
                 // a reversal is imminent.  Entering daily NO at this point means buying
                 // into the last ticks of a NO surge — adverse selection is at its peak.
                 if hourly_no_obi.abs() > dc.gboost_obi_exhaustion_block {
-                    veto!("hourly OBI exhausted");
+                    veto!(format!("hourly OBI exhausted (|{:.2}| > {:.2})", hourly_no_obi, dc.gboost_obi_exhaustion_block));
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.no_ask);
@@ -1523,11 +1787,11 @@ impl Strategy for GboostStrategyImpl {
                 || price < dc.gboost_min_entry_price
                 || price <= dec!(0)
             {
-                veto!("NO price out of range");
+                veto!(format!("NO price out of range (ask=${:.2}, allowed ${:.2}–${:.2})", price, dc.gboost_min_entry_price, dc.gboost_max_no_entry_price));
             }
             // ── 50-cent coin-flip zone gate ───────────────────────────────────
             if (price - dec!(0.50)).abs() < dc.gboost_min_edge_from_fair {
-                veto!("price too close to 0.50");
+                veto!(format!("price too close to 0.50 (ask=${:.2}, min edge {:.2})", price, dc.gboost_min_edge_from_fair));
             }
             // Confidence for NO direction is (1 - p_yes_up); scale size accordingly.
             let trade_usdc = scale_trade_size(1.0 - p_yes_up, entry_thresh, precomp_hist_vol, dc.gboost_max_exposure_usdc);
@@ -1541,7 +1805,7 @@ impl Strategy for GboostStrategyImpl {
                 let estimated_fee  = trade_usdc * fee_roundtrip;
                 let net_expected   = expected_gross - estimated_fee;
                 if net_expected < dc.gboost_min_net_profit_usdc {
-                    veto!("net profit too low");
+                    veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
             }
             let shares = trade_usdc / price;
@@ -1555,6 +1819,17 @@ impl Strategy for GboostStrategyImpl {
                 target_market.no_token.clone(),
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
+            // Viper Backtrace: persist the model/decision state for this entry.
+            crate::helpers::metrics::stash_entry_signals_json(target_market.no_token.as_str(), serde_json::json!({
+                "viper": "GBoost",
+                "side": "NO",
+                "p_yes_up": p_yes_up,
+                "entry_thresh": entry_thresh,
+                "entry_price": price.to_string(),
+                "trade_usdc": trade_usdc.to_string(),
+                "hist_vol": precomp_hist_vol,
+                "tick_momentum": precomp_tick_momentum,
+            }));
             // Record market-level hold lock to prevent rapid flip chop.
             self.market_hold_locks.lock().unwrap()
                 .insert(target_market.condition_id.clone(), ctx.mono_now);
@@ -1769,6 +2044,8 @@ mod tests {
             oracle_drift_10m: dec!(30), // ~10min drift for test
             hist_vol: dec!(0.003), // normal live-BTC 60m realized-vol — clears GBOOST_MIN_HIST_VOL
             institutional_pulse: dec!(0.5), tide_coherence: dec!(0.7),
+            tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+            vix_proxy: dec!(0), vix_velocity: dec!(0),
             oi_delta_pct: dec!(0.01), cvd_ratio: dec!(1.2),
             secs_to_expiry: 3600, // 1 hour — mid-range for tests
             timestamp: Utc::now(),
@@ -1838,14 +2115,14 @@ mod tests {
 
     #[tokio::test]
     async fn no_signal_without_model() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let signal = strategy.evaluate_entry(&make_ctx()).await.unwrap();
         assert!(matches!(signal, StrategySignal::NoSignal));
     }
 
     #[tokio::test]
     async fn evaluates_with_trained_model() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10; // No lookahead needed
         let mut samples: Vec<TrainingSample> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1864,7 +2141,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_entry_is_kept_when_no_exit_signal() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let ctx = make_ctx();
 
         strategy.pending_entries.lock().unwrap().insert(
@@ -1898,7 +2175,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_entry_is_consumed_when_exit_signal_emitted() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let ctx = make_ctx();
 
         strategy.pending_entries.lock().unwrap().insert(

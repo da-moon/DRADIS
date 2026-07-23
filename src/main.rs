@@ -231,6 +231,8 @@ async fn run() -> Result<()> {
         let hb = Arc::clone(&process_heartbeat_secs);
         std::thread::spawn(move || {
             const PROCESS_WATCHDOG_TIMEOUT_SECS: u64 = 300; // 5 minutes
+            const SOFT_WARN_SECS: u64 = 180; // early breadcrumb before the hard kill
+            let mut soft_warned = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
                 let last_beat = hb.load(AtomicOrdering::Relaxed);
@@ -239,11 +241,31 @@ async fn run() -> Result<()> {
                     .unwrap_or_default()
                     .as_secs();
                 let silent_secs = now_secs.saturating_sub(last_beat);
+                // Lock-free read of the last activity breadcrumb — safe even if the
+                // tokio runtime is fully wedged on a std::sync primitive.
+                let (phase, phase_secs, seq) = dradis::helpers::watchdog::snapshot();
+
+                // Soft warning: emit ONE early breadcrumb naming the stalling phase so
+                // the cause is captured in logs even if the loop recovers before 300s.
+                if silent_secs > SOFT_WARN_SECS && silent_secs <= PROCESS_WATCHDOG_TIMEOUT_SECS {
+                    if !soft_warned {
+                        eprintln!(
+                            " OS WATCHDOG: trading loop silent for {}s (soft warn @ {}s) \
+                             — last phase={} (in phase {}s, seq={})",
+                            silent_secs, SOFT_WARN_SECS, phase, phase_secs, seq
+                        );
+                        soft_warned = true;
+                    }
+                } else if silent_secs <= SOFT_WARN_SECS {
+                    soft_warned = false; // loop is healthy again — re-arm the soft warn
+                }
+
                 if silent_secs > PROCESS_WATCHDOG_TIMEOUT_SECS {
                     eprintln!(
                         " OS WATCHDOG: trading loop silent for {}s (limit={}s) \
+                         — frozen phase={} (in phase {}s, seq={}) \
                          — calling process::exit(1) to trigger Docker restart",
-                        silent_secs, PROCESS_WATCHDOG_TIMEOUT_SECS
+                        silent_secs, PROCESS_WATCHDOG_TIMEOUT_SECS, phase, phase_secs, seq
                     );
                     std::process::exit(1);
                 }
@@ -604,22 +626,44 @@ async fn run() -> Result<()> {
         // Tide Raptor — "Institutional Pulse" from spot-BTC-ETF premium. BTC-only
         // and singular: spawned for the btc asset, reusing its live oracle feed.
         // ETH/SOL squadrons get `tide: None`. Observe-only (not consumed by Vipers).
-        let tide_rx = if asset == "btc" {
+        //
+        // Horizon Raptor shares the same Alpaca connection with Tide (free tier
+        // allows only one concurrent connection per account). The shared quote map
+        // holds all equity quotes (BTC ETFs + SPY/QQQ/UVXY).
+        let (tide_rx, horizon_rx) = if asset == "btc" {
+            // Create the shared quote map for both Tide and Horizon raptors
+            let shared_quotes = dradis::raptors::tide::new_shared_quote_map();
+
+            // Spawn Tide Raptor
             let (tide_tx, tide_rx) =
                 watch::channel(dradis::raptors::tide::TideSnapshot::default());
             let oracle_rx_c = oracle_rx.clone();
             let health = Arc::clone(&raptor_health_tx);
+            let quotes_for_tide = Arc::clone(&shared_quotes);
             spawn_supervised("tide-raptor", move || {
                 dradis::raptors::tide::run_tide_raptor(
-                    oracle_rx_c.clone(), tide_tx.clone(), Arc::clone(&health),
+                    oracle_rx_c.clone(), tide_tx.clone(), Arc::clone(&health), Arc::clone(&quotes_for_tide),
                 )
             });
-            Some(tide_rx)
+
+            // Spawn Horizon Raptor (reads from same shared quote map)
+            let (horizon_tx, horizon_rx) =
+                watch::channel(dradis::raptors::horizon::HorizonSnapshot::default());
+            let velocity_rx_c = velocity_rx.clone();
+            let health = Arc::clone(&raptor_health_tx);
+            let quotes_for_horizon = Arc::clone(&shared_quotes);
+            spawn_supervised("horizon-raptor", move || {
+                dradis::raptors::horizon::run_horizon_raptor(
+                    Arc::clone(&quotes_for_horizon), velocity_rx_c.clone(), horizon_tx.clone(), Arc::clone(&health),
+                )
+            });
+
+            (Some(tide_rx), Some(horizon_rx))
         } else {
-            None
+            (None, None)
         };
 
-        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, Some(sports_rx.clone()));
+        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, horizon_rx, Some(sports_rx.clone()));
 
         // ── Per-asset session state ────────────────────────────────────────────
         // startup_balance is the real wallet balance at process start — used as
@@ -692,6 +736,36 @@ async fn run() -> Result<()> {
             session.starting_collateral.clone(),
             config_rx.clone(),
         ));
+    }
+
+    // ── Admiral Adama infrastructure for user-deployed squadrons ─────────────
+    // Bundles ALL trading handles needed to spawn real squadrons. The processor
+    // runs here in main.rs where we have access to the wallet_provider.
+    if let Some(ref session) = primary_session {
+        let adama_infra = Arc::new(dradis::cag::adama::AdamaInfrastructure {
+            trading_client: Arc::clone(&trading_client),
+            signer:         signer.clone(),
+            nonce_manager:  Arc::clone(&nonce_manager),
+            safe_address,
+            eoa_address,
+            shared_http:    Arc::clone(&shared_http),
+            wallet_provider: wallet_provider.clone(),
+            cag:            cag.clone(),
+            default_session: session.clone(),
+            markets_tx:     Arc::clone(&markets_tx),
+            sports_raptor:  Some(sports_rx.clone()),
+            tg_token:       env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+            tg_chat_id:     env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
+            tw_api_key:     env::var("X_API_KEY").unwrap_or_default(),
+            tw_api_secret:  env::var("X_API_SECRET").unwrap_or_default(),
+            tw_access_token: env::var("X_ACCESS_TOKEN").unwrap_or_default(),
+            tw_access_token_secret: env::var("X_ACCESS_TOKEN_SECRET").unwrap_or_default(),
+            process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
+        });
+        
+        // Spawn the Admiral Adama deployment processor
+        tokio::spawn(dradis::cag::adama::run_adama_processor(adama_infra));
+        info!("✅ Admiral Adama processor started — user squadrons can now be deployed");
     }
 
     // Block until ALL market loops exit (expected: never — each loops forever).

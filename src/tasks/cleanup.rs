@@ -50,7 +50,18 @@ use sqlx;
 /// finds balance = 0, and the tx succeeds as a silent no-op (no tokens burned, no payout).
 ///
 /// Reference: https://docs.polymarket.com/developers/CTF/redeem-positions
+///
+/// **2026-07-21 caveat**: "ALL" is only true for positions minted after the pUSD
+/// migration.  Older positions (observed: June/early-July 2026 markets) were minted
+/// with USDC.e collateral — redeeming those with pUSD computes the wrong position ID
+/// and silently no-ops (6 stuck redeemables, each "redeemed" successfully at
+/// 2026-07-20 23:19 with 0 tokens burned, then blacklisted forever by
+/// PERMANENTLY_SETTLED_CONDITIONS).  Use `detect_condition_collateral` to pick the
+/// right collateral per condition instead of assuming pUSD.
 const PUSD_COLLATERAL: Address = alloy_address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+
+/// USDC.e (bridged USDC) on Polygon — collateral for pre-pUSD-migration positions.
+const USDCE_COLLATERAL: Address = alloy_address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
 /// Gnosis Conditional Token Framework contract on Polygon.
 const CTF_ADDRESS: Address = alloy_address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
@@ -131,6 +142,16 @@ sol! {
             address refundReceiver,
             bytes   memory signatures
         ) external payable returns (bool success);
+    }
+
+    /// CTF view functions (called via RPC, not through the Safe).
+    #[sol(rpc)]
+    interface ICtfView {
+        function getCollectionId(
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256 indexSet
+        ) external view returns (bytes32);
     }
 
     /// Calldata encoder for the CTF contract.
@@ -216,6 +237,57 @@ async fn execute_via_safe<P: Provider + Clone>(
     Ok(tx_hash)
 }
 
+/// Detect which collateral token a resolved condition's outcome tokens were minted with.
+///
+/// The ERC1155 position ID is `keccak256(collateralToken ++ collectionId)`, so a redeem
+/// call with the wrong collateral computes a different position ID, finds balance = 0,
+/// and the TX "succeeds" as a silent no-op (observed 2026-07-20: six pre-pUSD-migration
+/// positions "redeemed" with pUSD collateral, 0 tokens burned, then blacklisted forever).
+///
+/// We fetch the collection ID for the leg's index set via the CTF view function (it uses
+/// elliptic-curve math, so it can't be computed locally), then keccak-match the position's
+/// actual token ID against candidate collaterals.  Falls back to pUSD (the current
+/// default) if the RPC call fails or nothing matches.
+async fn detect_condition_collateral<P: Provider + Clone>(
+    provider: P,
+    condition_id: B256,
+    leg_token_id: U256,
+    leg_outcome_index: i32,
+) -> Address {
+    use alloy::primitives::keccak256;
+
+    let index_set = U256::from(1u64) << (leg_outcome_index as usize); // outcome 0 → 0b01, 1 → 0b10
+    let ctf = ICtfView::new(CTF_ADDRESS, provider);
+    let collection_id = match tokio_timeout(
+        std::time::Duration::from_secs(10),
+        ctf.getCollectionId(B256::ZERO, condition_id, index_set).call(),
+    ).await {
+        Ok(Ok(cid)) => cid,
+        Ok(Err(e)) => {
+            warn!("Auto-settle: getCollectionId failed for condition {} — assuming pUSD: {}", condition_id, e);
+            return PUSD_COLLATERAL;
+        }
+        Err(_) => {
+            warn!("Auto-settle: getCollectionId timed out for condition {} — assuming pUSD", condition_id);
+            return PUSD_COLLATERAL;
+        }
+    };
+
+    for collateral in [PUSD_COLLATERAL, USDCE_COLLATERAL] {
+        let mut buf = [0u8; 52];
+        buf[..20].copy_from_slice(collateral.as_slice());
+        buf[20..].copy_from_slice(collection_id.as_slice());
+        if U256::from_be_bytes(keccak256(buf).0) == leg_token_id {
+            return collateral;
+        }
+    }
+    warn!(
+        "Auto-settle: token {} of condition {} matches neither pUSD nor USDC.e position ID — assuming pUSD",
+        leg_token_id, condition_id
+    );
+    PUSD_COLLATERAL
+}
+
 /// Remove all positions for a market that has expired or is expiring within 60s.
 ///
 /// D6: before dropping expired positions, GHOST positions are settled at their binary
@@ -242,6 +314,9 @@ pub async fn cleanup_expired_positions(
     // that also drops expired live positions is preserved exactly.
     force: bool,
 ) {
+    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Cleanup);
+    // NOTE: pos_map is locked in a scoped block below (HEAD refactor), not here.
+    // Adding a top-level lock would double-lock this non-reentrant Mutex → deadlock.
     let now = Utc::now();
 
     // Slice 2b: positions are keyed by the neutral MarketId directly.
@@ -644,6 +719,7 @@ fn infer_asset_from_title(title: &str) -> Option<&'static str> {
 /// building the live-ID set; the hex format would never match and would cause
 /// every valid DB row to be wrongly purged on every tick.
 pub async fn sync_open_positions_with_chain(safe_address: Address) {
+    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::ChainSync);
     // Collect all per-asset pools.  The Data API returns wallet-wide positions
     // regardless of which asset opened them, so we must sync EVERY asset DB —
     // not just the primary — to keep secondary asset open_positions tables in sync.
@@ -709,6 +785,17 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         .map(|p| p.asset.to_string())
         .collect();
 
+    // Resolved marks for redeemable positions: token_id → (cur_price, on-chain size).
+    // cur_price on a redeemable position reflects the resolved outcome (~$1 winner /
+    // ~$0 loser). purge_stale_open_positions uses this to book BOTH legs of a settled
+    // pair at resolution time ("pending redemption"), so net P&L never shows a phantom
+    // loss while the winning leg awaits on-chain redemption.
+    let redeemable_marks: HashMap<String, (Decimal, Decimal)> = live_positions
+        .iter()
+        .filter(|p| p.redeemable)
+        .map(|p| (p.asset.to_string(), (p.cur_price, p.size)))
+        .collect();
+
     // ── Sync EVERY per-asset pool ─────────────────────────────────────────────
     // Each asset stores its own open_positions rows in its own SQLite file.
     // Apply purge + adopt with asset-filtered live IDs for each pool.
@@ -725,8 +812,8 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
-        // Purge stale rows in this asset's DB.
-        total_purged += db::purge_stale_open_positions(&pool, &live_ids).await;
+        // Purge stale rows in this asset's DB (books resolved legs at settlement value).
+        total_purged += db::purge_stale_open_positions(&pool, &live_ids, &redeemable_marks).await;
 
         // Re-adopt on-chain positions missing from this asset's DB.
         // Query AFTER the purge so we don't re-adopt something just removed.
@@ -855,7 +942,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         info!(" Chain-sync: purged {} stale open_positions row(s) across {} asset DB(s)", total_purged, all_assets.len());
     }
     if redeemable_count > 0 {
-        info!("⏳ Chain-sync: skipped {} redeemable (settled) position(s) — auto_settle will handle redemption", redeemable_count);
+        info!("⏳ Chain-sync: {} redeemable (settled) position(s) booked at resolution — auto_settle will claim the cash", redeemable_count);
     }
     if unmatched_titles > 0 {
         warn!("⚠️ Chain-sync: {} live position(s) had unknown market-asset title and were not mapped to an asset DB", unmatched_titles);
@@ -884,6 +971,7 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     safe_address: Address,
     eoa_address: Address,
 ) -> bool {
+    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Settlement);
     // Avoid concurrent settlement scans/submits from multiple squadron tasks.
     let _settle_guard = match AUTO_SETTLE_RUN_LOCK.try_lock() {
         Ok(g) => g,
@@ -1022,8 +1110,23 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
             }
         } else {
             // Standard binary market redemption via CTF.
+            // Detect the collateral from a held leg's actual token ID: pre-pUSD-migration
+            // positions were minted with USDC.e, and redeeming with the wrong collateral
+            // silently no-ops (see PUSD_COLLATERAL doc).
+            let collateral = match legs.iter().find(|p| shares_to_base_units(p.size) > 0) {
+                Some(leg) => detect_condition_collateral(
+                    wallet_provider.clone(),
+                    condition_id,
+                    leg.asset,
+                    leg.outcome_index,
+                ).await,
+                None => PUSD_COLLATERAL, // unreachable: zero-units guard above
+            };
+            if collateral != PUSD_COLLATERAL {
+                info!("Auto-settle: condition {} uses legacy USDC.e collateral", condition_id);
+            }
             let calldata = ICtfDirect::redeemPositionsCall {
-                collateralToken: PUSD_COLLATERAL,
+                collateralToken: collateral,
                 parentCollectionId: B256::ZERO,
                 conditionId: condition_id,
                 indexSets: vec![U256::from(1u64), U256::from(2u64)],
@@ -1162,6 +1265,18 @@ async fn record_settled_arb_trade(
             let pnl = (Decimal::ONE - entry_per_pair) * pairs;
             let market_title = yes_leg.title.clone();
 
+            // Cross-path dedup: chain-sync may have already booked both legs at
+            // resolution ("pending redemption" rows). This redemption is then a
+            // cash-only event — booking the pair again would double-count the P&L.
+            if db::market_has_pending_redemption_settlement(&pool, &market_title).await {
+                debug!(
+                    "Auto-settle: pair settlement for \"{}\" suppressed — already booked at \
+                     resolution (pending-redemption rows exist)",
+                    market_title
+                );
+                return;
+            }
+
             let inserted = db::record_settlement_trade_idempotent(
                 &pool,
                 "ArbitrageStrategy",
@@ -1197,15 +1312,20 @@ async fn record_settled_arb_trade(
                 return;
             }
 
-            // Cost basis: prefer the Data API avg_price; if it returns 0 (observed
-            // for churn-residual legs), fall back to the local `entries` cost basis
-            // for this token. Previously a 0 avg_price silently dropped the whole
-            // settlement — a real on-chain redemption with NO trade row (2026-06-21).
-            let mut avg_price = leg.avg_price;
+            // Cost basis AND originating strategy: prefer the local `entries` log (the
+            // strategy that actually opened this leg). If the Data API avg_price is 0
+            // (observed for churn-residual legs) fall back to the logged cost basis.
+            // Previously this hardcoded strategy = "ArbitrageStrategy", which mislabeled
+            // any non-arb single leg (e.g. a Convergence NO leg on an hourly market that
+            // rode to settlement) AND, combined with the ledger-reconcile path booking
+            // the same position under its true strategy, produced a DOUBLE-COUNT
+            // (2026-07-13: one 13.72-share NO leg booked twice, ≈ −$4.94 each).
+            let (mut avg_price, logged_strategy) = match db::lookup_entry_db(&pool, &leg.asset.to_string()).await {
+                Some((p, s)) => (p, if s.is_empty() { None } else { Some(s) }),
+                None => (leg.avg_price, None),
+            };
             if avg_price <= Decimal::ZERO {
-                if let Some(p) = db::lookup_entry_price_db(&pool, &leg.asset.to_string()).await {
-                    avg_price = p;
-                }
+                avg_price = leg.avg_price;
             }
             if avg_price <= Decimal::ZERO {
                 warn!(
@@ -1229,9 +1349,33 @@ async fn record_settled_arb_trade(
             let pnl = (exit_price - avg_price) * size;
             let market_title = leg.title.clone();
 
+            // Cross-path dedup: the ledger-reconcile path (purge_stale_open_positions)
+            // may have already booked this same position (matched on market + shares)
+            // under its true strategy/reason. Its fingerprint differs from ours, so the
+            // idempotent-insert guard below would NOT catch it — check explicitly here.
+            // Likewise, chain-sync may have booked this leg at resolution ("pending
+            // redemption") — the redemption is then a cash-only event.
+            if db::market_has_pending_redemption_settlement(&pool, &market_title).await {
+                debug!(
+                    "Auto-settle: single-leg {} settlement for \"{}\" suppressed — already \
+                     booked at resolution (pending-redemption row exists)",
+                    side, market_title
+                );
+                return;
+            }
+            if db::market_has_matching_trade(&pool, &market_title, size).await {
+                debug!(
+                    "Auto-settle: single-leg {} settlement for \"{}\" suppressed — already booked \
+                     ({} sh) by another path (ledger reconcile or strategy close)",
+                    side, market_title, size
+                );
+                return;
+            }
+
+            let settle_strategy = logged_strategy.as_deref().unwrap_or("ArbitrageStrategy");
             let inserted = db::record_settlement_trade_idempotent(
                 &pool,
-                "ArbitrageStrategy",
+                settle_strategy,
                 &market_title,
                 side,
                 avg_price,
@@ -1244,8 +1388,8 @@ async fn record_settled_arb_trade(
 
             if inserted {
                 info!(
-                    " ArbitrageStrategy single-leg settlement: \"{}\" | {} {} @ ${:.4} → resolved ${:.4} → pnl ${:.4}",
-                    market_title, size, side, avg_price, exit_price, pnl
+                    " {} single-leg settlement: \"{}\" | {} {} @ ${:.4} → resolved ${:.4} → pnl ${:.4}",
+                    settle_strategy, market_title, size, side, avg_price, exit_price, pnl
                 );
             } else {
                 debug!(

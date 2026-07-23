@@ -58,6 +58,10 @@ pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.025);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 100
 
+/// Quote-persistence debounce: profitable bid_sum must hold continuously this many
+/// seconds before the arb enters (filters phantom arbs during fast BTC moves).
+pub const ARB_QUOTE_PERSISTENCE_SECS: u64 = 5;
+
 /// Maximum allowable gap between our safe bid and the current ask on each arb leg.
 /// Conservative profile: 3 ticks — only enter when the book is tight on both legs.
 pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.03);
@@ -73,6 +77,8 @@ pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 /// Conservative: stricter 0.85 (fewer entries, lowest orphan risk).
 pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.95);
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.02);
+pub const ARB_FLATTEN_MIN_BID_BUFFER: Decimal = dec!(0.03);
+pub const ARB_FLATTEN_BID_HAIRCUT_PCT: Decimal = dec!(0.06);
 
 /// Upper bound on single-leg orphan rescue cost in the arb entry gate. Conservative:
 /// tighter bound rejects lopsided books sooner — fewer fills, lower orphan risk.
@@ -210,6 +216,22 @@ pub const MOMENTUM_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const ENABLE_MAKER_TRADING: bool = true;
 
 pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
+/// Oracle-drift quote pull: cancel unfilled resting quote on adverse oracle move.
+/// Conservative: 3 bps — pulls at the first hint of adverse drift.
+pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0003);
+/// Gate-dwell: gates must pass continuously this long before quoting.
+/// Conservative: 30s — only quote into persistently calm books.
+pub const MAKER_GATE_DWELL_SECS: i64 = 30;
+
+// ── Horizon Raptor maker gate (2026-07-21, observe-first) ───────────────────
+/// Master switch: false = observe-only (log "would veto", never suppress).
+pub const MAKER_HORIZON_GATE_ENFORCE: bool = false;
+/// Suppress BOTH maker sides when UVXY 5s velocity exceeds this ($/5s).
+pub const MAKER_HORIZON_VIX_VEL_MAX: Decimal = dec!(0.07);
+/// Suppress the adverse maker side when |tradfi_velocity| exceeds this ($/5s).
+pub const MAKER_HORIZON_TRADFI_VETO: Decimal = dec!(0.10);
+/// Directional TradFi vetoes require at least this QQQ-vs-BTC macro coherence.
+pub const MAKER_HORIZON_COHERENCE_MIN: Decimal = dec!(0.4);
 pub const MAKER_BID_BUFFER: Decimal = dec!(0.04);
 /// Requires a wider spread before posting — more edge per fill.
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.05);
@@ -241,6 +263,9 @@ pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.04);
 /// Longer hold before stop-loss can fire — avoids cutting on noise.
 pub const MAKER_MIN_HOLD_SECS_BEFORE_STOP: i64 = 900;
 pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = MAKER_MIN_HOLD_SECS_BEFORE_STOP;
+/// Catastrophic floor at (live SL × mult), ungated by min-hold (2026-07-14).
+/// Conservative: tightest hard floor — cut fast moves early.
+pub const MAKER_CATASTROPHIC_SL_MULT: Decimal = dec!(1.25);
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 900;
 pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.88);
 pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(2.5);
@@ -379,6 +404,21 @@ pub const TIDE_ALPACA_SECRET_ENV: &str = "ALPACA_API_SECRET_KEY";
 /// Prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
+// ── Horizon Raptor (TradFi velocity / VIX proxy) ──────────────────────────────
+//
+// NOTE: The Horizon Raptor shares the Alpaca IEX connection with the Tide Raptor
+// (via SharedQuoteMap). No separate Alpaca credentials needed.
+
+/// Compute tick interval for the Horizon Raptor signal recompute loop.
+pub const HORIZON_TICK_MS: u64 = 500;
+
+/// Max age (seconds) of an equity quote before it's considered stale.
+pub const HORIZON_QUOTE_STALENESS_SECS: u64 = 30;
+
+/// Rolling window (seconds) for the macro coherence Pearson correlation
+/// between BTC velocity and QQQ velocity. 10 minutes = 600s.
+pub const HORIZON_CORRELATION_WINDOW_SECS: u64 = 600;
+
 
 // ── Sports Raptor (The Odds API line-movement feed) ──────────────────────────
 //
@@ -429,8 +469,12 @@ pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
 pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.42); // Conservative: further from 50¢ coin-flip zone
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
-pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
+pub const GBOOST_LOOKAHEAD_TICKS: usize = 200; // legacy — superseded 2026-07-14 by GBOOST_LABEL_HORIZON_SECS
+pub const GBOOST_HISTORY_MIN_SPACING_MS: i64 = 500; // time-decimated snapshot buffer
+pub const GBOOST_LABEL_HORIZON_SECS: i64 = 300; // conservative: longer horizon, slower but steadier signal
+pub const GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC: f64 = 0.0003; // skip flat samples (<3bp move)
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
+pub const GBOOST_LABEL_POOL_CAP: usize = 8000; // conservative: larger pool — more data, smoother model
 pub const GBOOST_MIN_RETRAIN_INTERVAL_SECS: u64 = 300;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
 pub const GBOOST_BUDGET: f32 = 0.80; // raised from 0.65 — gives perpetual room to grow past 1 tree
@@ -440,6 +484,9 @@ pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
 /// Conservative: tighter OBI gate — don't enter unless book is near neutral or favorable.
 pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25); // already at floor; confirmed 2026-05-08
+/// OBI EMA smoothing (2026-07-14). Conservative: longer tau demands sustained book support.
+pub const GBOOST_OBI_EMA_TAU_SECS: f64 = 90.0;
+pub const GBOOST_OBI_EMA_STALE_SECS: f64 = 30.0;
 /// Minimum fraction of price distance from 0.50 required for a GBoost entry.
 /// Conservative: higher edge requirement — only trade when there is meaningful directional conviction.
 pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.06);
@@ -466,8 +513,8 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.070); // conservative: 7.0%
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v26f.json";
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v26f.json";
+pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v30g_o180.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v30g_o180.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Conservative: same threshold — label imbalance is a data quality issue, not a risk preference.
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
@@ -606,13 +653,23 @@ pub const TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS: u64 = 240;
 /// Conservative: tight OBI gates — only enter on near-neutral or favorable books.
 pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
 
-// ── TrendReversal mode (2026-06-29) ──────────────────────────────────────────
-// Fade the detected drift (buy the opposite token) instead of following it.
-pub const TRENDREVERSAL_MODE: bool = false;  // A/B TEST: follow (invert fade). Data 07-02→03: fade 0W/9L, drift continued not reverted.
+// ── TrendReversal mode (2026-06-29, reworked 2026-07-14) ─────────────────────
+pub const TRENDREVERSAL_MODE: bool = true; // fade a sharp 10m spike in a FLAT 60m macro (reworked 2026-07-14; follow mode lost 79% of trades)
 pub const TRENDREVERSAL_EXHAUSTION_MULT: Decimal = dec!(1.5);
 pub const TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT: Decimal = dec!(0.004);
-pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.15);
-pub const TRENDREVERSAL_STOP_LOSS_PCT: Decimal = dec!(0.04);
+
+// ── Horizon Raptor fade veto (2026-07-21, observe-first) ────────────────────
+/// Master switch: false = observe-only (log "would veto", never suppress).
+pub const TRENDREVERSAL_HORIZON_VETO_ENFORCE: bool = false;
+/// Veto a fade when tradfi_velocity confirms the drift direction beyond this ($/5s).
+pub const TRENDREVERSAL_HORIZON_TRADFI_CONFIRM: Decimal = dec!(0.07);
+/// Minimum macro_coherence for the fade veto to apply.
+pub const TRENDREVERSAL_HORIZON_COHERENCE_MIN: Decimal = dec!(0.4);
+pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.06); // conservative: bank the revert early
+pub const TRENDREVERSAL_STOP_LOSS_PCT: Decimal = dec!(0.10);
+pub const TRENDREVERSAL_MAX_HOLD_SECS: i64 = 1800; // fade time-stop: 30 min
+pub const TRENDREVERSAL_CATASTROPHIC_SL_PCT: Decimal = dec!(0.15); // hard floor, ungated
+pub const TRENDREVERSAL_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.06); // block coin-flip-zone entries
 
 pub const TRENDCAPTURE_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.70);
 
@@ -1042,7 +1099,18 @@ pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.12); // 2026-07-10:
 pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(1.5); // 2026-07-10: tightened from 2.0.
 
 /// After a catastrophic stop, block BOTH legs of that market for this long.
-pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;
+pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;  // legacy — superseded by CONVERGENCE_STOP_MARKET_COOLDOWN_SECS
+
+/// Market-wide cooldown (both legs) after ANY stop exit — regular SL or catastrophic.
+/// A stop-out means the market hour is chopping against the macro signal — stand down.
+pub const CONVERGENCE_STOP_MARKET_COOLDOWN_SECS: u64 = 2700;
+
+/// Entry-signal persistence debounce: the full signal stack must hold continuously
+/// this many seconds before entry (filters transient mid-vol-burst pulses).
+pub const CONVERGENCE_ENTRY_PERSISTENCE_SECS: u64 = 90;
+
+/// Max gap (seconds) between signal sightings before the persistence clock resets.
+pub const CONVERGENCE_SIGNAL_CONTINUITY_GAP_SECS: u64 = 30;
 
 /// Per-token cooldown after any exit before re-entry is allowed (seconds).
 pub const CONVERGENCE_POST_EXIT_COOLDOWN_SECS: u64 = 300;

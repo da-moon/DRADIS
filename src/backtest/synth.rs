@@ -222,6 +222,13 @@ impl SnapshotSynthesizer {
             tide_coherence: dec!(0),
             oi_delta_pct: dec!(0),
             cvd_ratio: dec!(0),
+            // Tier C — Horizon raptor (TradFi/VIX) and oracle realized-vol have no
+            // feed in the synthetic price-only backtest; gates treat these as absent.
+            tradfi_velocity: dec!(0),
+            macro_coherence: dec!(0),
+            vix_proxy: dec!(0),
+            vix_velocity: dec!(0),
+            hist_vol: dec!(0),
             oracle_drift_60m: k.drift_60m,
             oracle_drift_10m: k.drift_10m,
             secs_to_expiry,

@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -157,6 +157,8 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 │  (Binance/Hyperliq)  │   │                      │
 │  Tide Raptor         │   │                      │
 │  (Alpaca IEX + iNAV) │   │                      │
+│  Horizon Raptor      │   │                      │
+│  (SPY/QQQ/UVXY)      │   │                      │
 │  Sports Raptor       │   │                      │
 │  (The Odds API)      │   │                      │
 └──────────┬───────────┘   └───────────┬──────────┘
@@ -225,6 +227,32 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 - **Strategy Timeout**: Each Viper evaluation is hard-capped at 500ms. A hung Viper is skipped for that tick — the engine never freezes.
 - **REST API**: axum server on `:9000` exposes live config, P&L, positions, and trade history to the Control Tower.
 
+### REST API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/health` | GET | Liveness check |
+| `/api/assets` | GET | List initialized asset pools |
+| `/api/config` | GET | Current DynamicConfig as JSON |
+| `/api/config` | PATCH | JSON merge-patch — hot-reloads strategies |
+| `/api/config/schema` | GET | Editable-config field schema |
+| `/api/pnl/history` | GET | Recent P&L snapshots |
+| `/api/trades` | GET | Recent completed trades |
+| `/api/positions` | GET | Current open positions |
+| `/api/squadrons` | GET | List all active squadrons |
+| `/api/squadrons/{id}` | GET | Get one squadron by id |
+| `/api/squadrons/{id}/config` | GET/PATCH | Squadron-specific config |
+| `/api/squadrons/deploy` | POST | Queue a new squadron deployment |
+| `/api/deployments` | GET | List deployment queue status |
+| `/api/deployment/region` | GET | Region + available market types |
+| `/api/markets/available` | GET | Fetch markets by type from Gamma API |
+| `/api/taxonomy/raptors` | GET | Raptor kinds for market class |
+| `/api/taxonomy/vipers` | GET | Viper kinds for market class |
+| `/api/telemetry` | GET | Live Raptor signal snapshots |
+| `/api/llm/recommendations` | GET | Recent LLM Advisor analyses |
+
+All data endpoints accept `?asset=btc` query param to scope to a specific asset pool.
+
 ---
 
 ##  Raptor Wing (`src/raptors/`)
@@ -239,12 +267,15 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 | **Funding Raptor**             | Binance or Hyperliquid (`MARKET_DATA_SOURCE`) | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
 | **Derivatives Raptor**         | Binance or Hyperliquid (`MARKET_DATA_SOURCE`) | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
 | **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
+| **Horizon Raptor**             | Alpaca IEX (shared)     | TradFi velocity (SPY/QQQ), macro coherence (BTC↔QQQ), VIX proxy (UVXY) — BTC-only, US-hours | `src/raptors/horizon.rs` |
 | **Sports Raptor**              | The Odds API (h2h)      | Vig-free consensus probability, line drift, book dispersion — venue-neutral (US + intl), **observe-only** | `src/raptors/sports.rs` |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
-When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence); Basis, Momentum and TrendCapture use them as confirmation gates; and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
+When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence, TradFi velocity/VIX); Basis, Momentum and TrendCapture use them as confirmation gates; Maker and TrendCapture consume the Horizon macro signal as preventative gates (VIX-spike / coherent-TradFi-flow quote suppression, fade veto — observe-first, enforcement behind config flags); and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
 
-The **Sports Raptor** is the first non-crypto scout: a single venue-neutral instance shared by both the US and intl pipelines. It polls The Odds API (keyed on `ODDS_API_KEY`), reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus, and broadcasts line drift + book dispersion. Like the Tide Raptor it runs **observe-only** — it publishes telemetry but no Viper consumes it for sizing yet — and degrades silently to a neutral snapshot when no API key is set.
+The **Tide** and **Horizon** Raptors share a single Alpaca IEX WebSocket connection (free tier allows only one per account). Tide tracks BTC-specific institutional flow (ETF premium); Horizon tracks TradFi macro regime (equity velocity, VIX). Together they enable divergence detection — e.g., equities selling off but BTC ETFs at premium suggests institutional flight *into* crypto.
+
+The **Sports Raptor** is the first non-crypto scout: a single venue-neutral instance shared by both the US and intl pipelines. It polls The Odds API (keyed on `ODDS_API_KEY`), reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus, and broadcasts line drift + book dispersion. It runs **observe-only** — it publishes telemetry but no Viper consumes it for sizing yet — and degrades silently to a neutral snapshot when no API key is set.
 
 ### Market data source: Binance or Hyperliquid
 
@@ -287,6 +318,18 @@ Squadron
 └── SquadronState    →  STAGED → DEPLOYED → PATROLLING → RTB → STOOD_DOWN
 ```
 
+### Market Taxonomy
+
+Markets are classified into domains that determine which Raptors and Vipers are meaningful:
+
+| Market Class | Raptors | Vipers |
+|--------------|---------|--------|
+| `crypto` | Price, Funding, Derivatives, Tide | All eight Vipers |
+| `sports` | Sports (line movement) | Arbitrage, Maker (venue-agnostic) |
+| `politics` | Politics (roadmap) | Arbitrage, Maker (venue-agnostic) |
+
+Classification is data-driven via the `market_class_rule` table — add a new mapping (e.g., `tennis → sports`) with one INSERT, no code change.
+
 ### Composition presets
 
 | Preset          | Raptors         | Vipers                             |
@@ -299,7 +342,7 @@ Squadron
 
 | State        | Meaning                                          |
 |--------------|--------------------------------------------------|
-| `STAGED`     | Assembled, waiting for a battle location         |
+| `STAGED`     | Assembled, waiting for a battle location (user-deployed via UI) |
 | `DEPLOYED`   | Market acquired, WS subscriptions live           |
 | `PATROLLING` | Active trading tick loop running                 |
 | `RTB`        | Returning to base — no new entries, winding down |
@@ -355,14 +398,44 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **P&L Chart**      | Rolling equity curve across recent snapshots                                                     |
 | **Viper Cards**    | Live enabled/disabled toggle + all parameters editable inline without a restart                  |
 | **Open Positions** | In-flight positions with entry time, side (YES/NO/UP/DOWN in correct color), entry price, shares |
-| **Telemetry**      | Live Raptor macro cards — including the **Institutional Pulse** card (Tide pulse dial, coherence, per-ETF premium bps; greyed outside US market hours) |
+| **Telemetry**      | Live Raptor macro cards — **Tide** (ETF premium, institutional pulse), **Horizon** (TradFi velocity, VIX proxy), greyed outside US market hours |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
+| **CAG Registry**   | Active squadrons with market, state, deployed time, and **+ Deploy** button                      |
 
 ### Live Config Editing
 
 Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. The edit is fanned out to every squadron's config row and reaches running squadrons within ~30 seconds (each squadron reloads its config on a periodic timer).
 
 > **Hot-Enable Design** — All eight Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session; the change takes effect on running squadrons within ~30 seconds.
+
+### Squadron Builder (Admiral Adama Extension)
+
+The **+ Deploy** button in the CAG Registry panel opens the Squadron Builder modal — craft custom squadrons with market type selection, raptor/viper configuration, and regional deployment restrictions.
+
+| Mode | Description |
+|------|-------------|
+| **Quick Deploy** | Select market type (crypto/sports/politics) → DRADIS auto-selects the highest-liquidity market and optimal raptors/vipers |
+| **Full Control** | Browse available markets, manually select raptors and vipers, see implementation status badges |
+
+**Regional restrictions:**
+
+| Deployment | Available Market Types |
+|------------|------------------------|
+| US (`us_retail`) | Politics, Sports |
+| INTL (`intl_clob`) | Politics, Sports, Crypto |
+
+**Deployment flow:**
+```
+User → "+ Deploy" → Modal → POST /api/squadrons/deploy
+                                    ↓
+                        deployment_queue (pending)
+                                    ↓
+                    Admiral Adama processor (5s poll)
+                                    ↓
+               CAG.register_staged_deployment() → STAGED in UI
+```
+
+Staged squadrons appear in the CAG Registry. The auto-discovery loops for crypto assets (BTC/ETH/SOL) adopt staged deployments on their next market rotation.
 
 ### Authentication
 
@@ -558,24 +631,26 @@ advertised fetch/backtest/report API is unreachable dead code in the published c
 - A Polygon wallet with USDC and MATIC
 - **A paid Polygon RPC endpoint** (required for auto-settlement)
 - Telegram bot token (optional)
-- Alpaca API key/secret (optional — free tier; only needed for the **Tide Raptor**'s live IEX ETF feed. Without it the Institutional Pulse card stays idle.)
+- Alpaca API key/secret (optional — free tier; powers both **Tide** and **Horizon** Raptors from one connection. Without it both cards stay idle.)
 - The Odds API key (optional — free tier; only needed for the **Sports Raptor**'s line-movement feed. Without it the Sports Raptor pill stays idle.)
 
-### Tide Raptor (Institutional Pulse) — optional
+### Tide + Horizon Raptors (Alpaca IEX) — optional
 
-The Tide Raptor streams real-time spot-BTC-ETF (IBIT/FBTC/ARKB) prints from Alpaca's
-free-tier IEX feed and compares them to a synthetic iNAV (btc-per-share × Binance
-oracle) to produce the **Institutional Pulse** and **coherence** signals. It is
-BTC-only and active during US market hours (09:30–16:00 ET). To enable it, add your
-Alpaca keys to `.env`:
+The Tide and Horizon Raptors share a **single Alpaca IEX WebSocket connection** (free tier allows only one per account). Together they stream 6 symbols:
+
+| Raptor   | Symbols         | Signal |
+|----------|-----------------|--------|
+| **Tide** | IBIT, FBTC, ARKB | BTC ETF premium vs synthetic iNAV → "Institutional Pulse" |
+| **Horizon** | SPY, QQQ, UVXY | TradFi velocity, macro coherence (BTC↔QQQ), VIX proxy |
+
+Both are BTC-only and active during US market hours (09:30–16:00 ET). To enable them, add your Alpaca keys to `.env`:
 
 ```bash
 ALPACA_API_KEY_ID=your-key-id
 ALPACA_API_SECRET_KEY=your-secret-key
 ```
 
-These feed the GBoost feature vector, the Basis tide veto, and the **Convergence**
-Viper. Omit them and those consumers simply treat the pulse as neutral/zero.
+Tide feeds the GBoost feature vector, the Basis tide veto, and the **Convergence** Viper. Horizon feeds the GBoost feature vector (TradFi velocity, macro coherence, VIX proxy/velocity) and drives preventative gates on **Maker** (VIX-spike / coherent-TradFi-flow quote suppression) and **TrendCapture** (fade veto when TradFi confirms the drift) — the gates run observe-first and enforce once calibrated (`MAKER_HORIZON_GATE_ENFORCE`, `TRENDREVERSAL_HORIZON_VETO_ENFORCE`). Omit the keys and both run idle (neutral snapshots, offline pills).
 
 ### Sports Raptor (line movement) — optional
 

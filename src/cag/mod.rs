@@ -36,9 +36,12 @@
 /// `AbortHandle` therefore lives in `asset_tasks`, keyed by asset, not in
 /// any individual `CagEntry`.
 ///
-/// `CagEntry._handle` is reserved for the Admiral Adama extension, where the
-/// CAG will directly spawn individual one-shot patrol tasks into user-chosen
-/// markets.  It is always `None` in the current architecture.
+/// ## Admiral Adama Extension
+///
+/// `CagEntry._handle` stores the JoinHandle for squadrons spawned directly
+/// by Admiral Adama (via `register_adama_squadron`). The processor in
+/// `adama.rs` polls the deployment_queue and spawns real trading squadrons
+/// using `AdamaInfrastructure`, then registers them with the CAG.
 
 pub mod session;
 pub use session::SessionState;
@@ -47,6 +50,9 @@ pub use session::SessionState;
 pub mod run;
 #[cfg(feature = "intl_clob")]
 pub use run::{RunArgs, run_market_loop};
+
+#[cfg(feature = "intl_clob")]
+pub mod adama;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -287,6 +293,54 @@ impl Cag {
 
         info!(squadron = %id, "✈️  CAG: squadron registered via spawn_squadron");
         id
+    }
+
+    /// Register an Admiral Adama squadron in the CAG.
+    ///
+    /// Called by the Adama processor after successfully spawning a squadron.
+    /// Creates a `SquadronSummary` in the "PATROLLING" state visible in the
+    /// Control Tower UI.
+    ///
+    /// The `handle` parameter is the JoinHandle from the spawned patrol task,
+    /// allowing the CAG to track/cancel the squadron.
+    pub fn register_adama_squadron(
+        &self,
+        squadron_id: &str,
+        market_id: &str,
+        market_type: &str,
+        market_question: &str,
+        raptors: &[String],
+        vipers: &[String],
+        handle: tokio::task::JoinHandle<()>,
+    ) -> SquadronId {
+        let cancel_token = CancellationToken::new();
+
+        let summary = SquadronSummary {
+            id:                squadron_id.to_string(),
+            asset:             market_type.to_uppercase(),
+            name:              format!("{} Squadron", market_type.to_uppercase()),
+            state:             "PATROLLING".to_string(),
+            market_name:       market_question.to_string(),
+            maker_market_name: None,
+            deployed_at:       Utc::now(),
+            market_class:      market_type.to_string(),
+            raptors:           raptors.to_vec(),
+            vipers:            vipers.to_vec(),
+        };
+
+        self.inner.registry.insert(squadron_id.to_string(), CagEntry {
+            summary,
+            cancel_token,
+            _handle: Some(handle),
+        });
+
+        info!(
+            squadron = %squadron_id,
+            market_id = %market_id,
+            market_type = %market_type,
+            "✈️  CAG: Admiral Adama squadron registered and PATROLLING"
+        );
+        squadron_id.to_string()
     }
 
     /// Stand down a specific squadron by firing its cancellation token.

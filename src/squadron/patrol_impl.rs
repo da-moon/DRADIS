@@ -189,6 +189,9 @@ impl Squadron {
         // momentum-only deployments. Read into a local so no borrow guard is held
         // across an .await when the snapshot is built below.
         let tide_rx = self.raptors.tide.clone();
+        // Horizon Raptor is optional (shares the Alpaca WS with Tide; absent when
+        // undeployed). Same borrow-guard discipline as `tide_rx`.
+        let horizon_rx = self.raptors.horizon.clone();
         // Derivatives Raptor is optional (all-asset, but absent on price-only
         // deployments). Same borrow-guard discipline as `tide_rx`.
         let deriv_rx = self.raptors.derivatives.clone();
@@ -441,6 +444,7 @@ impl Squadron {
                         continue;
                     }
                     info!("🔄 Market switch detected — restarting trading loop with new market context");
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
 
                     // D6 fix: settle GHOST (paper) positions for the market(s) being rotated
                     // away, BEFORE this patrol tears down. Hourly markets rotate ~12 min before
@@ -561,6 +565,10 @@ impl Squadron {
                             .as_secs(),
                         AtomicOrdering::Relaxed,
                     );
+                    // Watchdog breadcrumb: we are building the market snapshot + evaluating
+                    // strategies. The executor refines this to the specific viper; a stall
+                    // before it reaches the executor still shows SIGNAL_EVAL.
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::SignalEval);
 
                     // Get hourly market snapshot
                     let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts) = *yes_price_rx.borrow();
@@ -604,6 +612,10 @@ impl Squadron {
                             funding_rate: *funding_rx.borrow(),
                             institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
                             tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
+                            tradfi_velocity: horizon_rx.as_ref().map(|r| r.borrow().tradfi_velocity).unwrap_or(Decimal::ZERO),
+                            macro_coherence: horizon_rx.as_ref().map(|r| r.borrow().macro_coherence).unwrap_or(Decimal::ZERO),
+                            vix_proxy: horizon_rx.as_ref().map(|r| r.borrow().vix_proxy).unwrap_or(Decimal::ZERO),
+                            vix_velocity: horizon_rx.as_ref().map(|r| r.borrow().vix_velocity).unwrap_or(Decimal::ZERO),
                             oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
                             cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             oracle_drift_60m: drift_rx.borrow().0,
@@ -629,6 +641,10 @@ impl Squadron {
                             hist_vol: drift_rx.borrow().2,
                             institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
                             tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
+                            tradfi_velocity: horizon_rx.as_ref().map(|r| r.borrow().tradfi_velocity).unwrap_or(Decimal::ZERO),
+                            macro_coherence: horizon_rx.as_ref().map(|r| r.borrow().macro_coherence).unwrap_or(Decimal::ZERO),
+                            vix_proxy: horizon_rx.as_ref().map(|r| r.borrow().vix_proxy).unwrap_or(Decimal::ZERO),
+                            vix_velocity: horizon_rx.as_ref().map(|r| r.borrow().vix_velocity).unwrap_or(Decimal::ZERO),
                             oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
                             cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             secs_to_expiry: mk.market_close_time
@@ -658,6 +674,7 @@ impl Squadron {
                     // `resolved_signals` simply makes the for-loop below a no-op.
 
                     // ── Signal-processing timeout guard (45 s) ───────────────────────
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::OrderPlace);
                     let signal_processing_result = tokio::time::timeout(Duration::from_secs(45), async {
 
                     for (strategy_name, signal) in resolved_signals {
@@ -728,7 +745,34 @@ impl Squadron {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
-                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep3 - p.avg_entry) * p.shares; } }
+                                            // The exchange says we don't hold the shares (typically: a prior
+                                            // FAK exit DID fill but a stale balance read resurrected the
+                                            // position — observed 2026-07-16).  The position is gone on-chain,
+                                            // so book the exit NOW at the estimated price and close the DB row.
+                                            // The old path credited session P&L silently with no trade record
+                                            // and no open_positions cleanup, so the ledger diverged and
+                                            // ChainReconcile later invented a second exit at the current mark.
+                                            let removed = { let mut map = positions.lock().await; map.remove(&pos_key) };
+                                            if let Some(p) = removed {
+                                                if p.fill_confirmed_at.is_some() {
+                                                    let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                    let pnl3 = (aep3 - p.avg_entry) * p.shares;
+                                                    warn!(
+                                                        "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — booking est. exit @ ${:.4} pnl=${:.4}",
+                                                        sn, es.chars().take(80).collect::<String>(), aep3, pnl3
+                                                    );
+                                                    *total_pnl.lock().await += pnl3;
+                                                    let sid3 = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
+                                                    metrics::record_trade(
+                                                        &asset_lc, sn.clone(), params.market_name.clone(), sid3,
+                                                        p.avg_entry, aep3, p.shares, pnl3,
+                                                        format!("{} (ExitUnverified: est. price — sell rejected, shares gone)", reason),
+                                                        p.ghost,
+                                                    ).await;
+                                                    if let Some(pool) = db::pool_for(&asset_lc) { db::close_open_position(&pool, &sn, &tid_m.to_string()).await; }
+                                                }
+                                                token_ownership.lock().await.remove(&tid_m);
+                                            }
                                             last_trade_time.insert(sn.clone(), Instant::now()); continue;
                                         }
                                         if es.contains("no orders found") {
@@ -837,12 +881,33 @@ impl Squadron {
                                             let sn_rec = sn.clone();
                                             let _tid_rec = tid.to_string();
                                             tokio::spawn(async move {
-                                                tokio::time::sleep(Duration::from_millis(2500)).await;
-                                                let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_async).unwrap_or_default());
-                                                let rem = match cl.balance_allowance(req).await {
-                                                    Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-                                                    Err(_) => {
-                                                        // Balance RPC failed — we can't confirm the fill. Re-insert the
+                                                // Poll the balance with escalating delays (2.5s, +5s, +10s).
+                                                // The balance API can lag a filled FAK by several seconds; a
+                                                // single stale read here showed 10/10 shares still held on
+                                                // 2026-07-16 for a FAK that HAD filled, resurrecting the
+                                                // position → retry exit → exchange reject → phantom P&L.
+                                                // Only trust a "nothing filled" answer after the final poll;
+                                                // any read showing a reduced balance is accepted immediately.
+                                                let mut rem: Option<Decimal> = None;
+                                                for (i, delay_ms) in [2500u64, 5000, 10000].iter().enumerate() {
+                                                    tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+                                                    let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_async).unwrap_or_default());
+                                                    match cl.balance_allowance(req).await {
+                                                        Ok(r) => {
+                                                            let b = Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                                                            rem = Some(b);
+                                                            if b < rs_m { break; } // fill visible — no need to keep polling
+                                                            if i < 2 {
+                                                                warn!("⏳ FAK verify [{}]: balance still shows {:.4}/{:.4} unfilled — re-polling (attempt {}/3)", sn_async, b, rs_m, i + 2);
+                                                            }
+                                                        }
+                                                        Err(_) => { /* transient RPC error — try next poll */ }
+                                                    }
+                                                }
+                                                let rem = match rem {
+                                                    Some(r) => r,
+                                                    None => {
+                                                        // All balance reads failed — we can't confirm the fill. Re-insert the
                                                         // position (no PnL credit, no DB write) so a later exit retry
                                                         // reconciles it, instead of leaking it out of the position map.
                                                         let mut map = ps.lock().await;
@@ -1387,6 +1452,10 @@ impl Squadron {
                                             let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone();
                                             let side_em = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
                                             let ep_em = p.price; let sh_em = p.shares; let asset_em = asset_lc.clone();
+                                            // Maker quotes evaluate the Window/Daily book — capture that
+                                            // snapshot so the entry_signals feature-vector matches what
+                                            // the strategy actually saw (falls back to primary snapshot).
+                                            let feat_snap_m = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
                                             // Write pending position immediately (Viper Launch)
                                             if let Some(pool) = db::pool_for(&asset_em) {
                                                 db::record_open_position_with_status(&pool, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
@@ -1397,7 +1466,8 @@ impl Squadron {
                                                     if let Some(pool) = db::pool_for(&asset_em) {
                                                         db::confirm_position_status(&pool, &sn_m, &tid_em).await;
                                                     }
-                                                    metrics::record_entry(&asset_em, sn_m, tid_em, mn_em, side_em, ep_em, sh_em, false).await;
+                                                    metrics::record_entry(&asset_em, sn_m.clone(), tid_em.clone(), mn_em.clone(), side_em.clone(), ep_em, sh_em, false).await;
+                                                    metrics::record_entry_signal(&asset_em, sn_m, tid_em, mn_em, side_em, ep_em, sh_em, &feat_snap_m).await;
                                                 }
                                             });
                                         }
@@ -1431,7 +1501,7 @@ impl Squadron {
                                     if let Some(pool) = db::pool_for(&asset_lc) {
                                         db::close_open_position(&pool, &sn, tok.as_str()).await;
                                     }
-                                    info!("🚫 Maker quote-pulled [{}]: {} — resting quote cancelled (book turned toxic)", sn, tok);
+                                    info!("🚫 Maker quote-pulled [{}]: {} — resting quote cancelled (toxic book / oracle drift)", sn, tok);
                                 }
                             }
                             StrategySignal::NoSignal => {}
@@ -1509,6 +1579,9 @@ impl Squadron {
                             });
                         }
                     }
+
+                    // Tick complete — back to waiting in the select!.
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Idle);
                 }
             }
         }

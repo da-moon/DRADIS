@@ -759,6 +759,23 @@ pub async fn arb_pair_fill_monitor(
               strategy_name, rehedge_price, dynamic_ceiling);
     }
 
+    // ── Purge the abandoned missing leg ─────────────────────────────────────────
+    // Reaching here means we've committed to flattening the FILLED leg instead of
+    // completing the pair (re-hedge was uneconomical or its FAK failed), so the
+    // missing leg will never be held. It never filled on-chain (balance 0 — rechecked
+    // above), which is exactly why the 5-min orphan backstop can't clean it: that
+    // backstop keys off *on-chain* holdings, and a zero-balance leg is invisible to
+    // it. Left alone, the missing leg's entry row lingers forever as a phantom
+    // "pending" open_position (fake notional on the dashboard, a stale token-ownership
+    // claim that blocks re-entry, polluted P&L). Drop it now from the DB, the
+    // in-memory map, and the ownership set. Idempotent: the sync task may have already
+    // phantom-removed the in-memory entry, and deleting an absent DB row is a no-op.
+    positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
+    token_ownership.lock().await.remove(&missing_market);
+    if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+        crate::helpers::db::close_open_position(&pool, &strategy_name, &missing_token.to_string()).await;
+    }
+
     // ── Guaranteed bid-flatten: a naked leg must NEVER ride to settlement ────────
     // When re-hedge is impossible/uneconomical we immediately FAK-SELL the filled leg
     // at the live bid. Worst case is the spread (~1–3¢/share) instead of a full leg
@@ -782,8 +799,17 @@ pub async fn arb_pair_fill_monitor(
             }
         }
     };
-    // Cross one tick below the bid to guarantee an immediate taker sell; floor at $0.01.
-    let sell_price = (bid_price - dec!(0.01)).max(dec!(0.01));
+    // Cross by the LARGER of an absolute buffer and a percentage haircut so the FAK
+    // limit reliably sweeps the real top-of-book even when the quoted bid is stale-high.
+    // FAK ⇒ the executed price is still the best resting bid; the lower limit only
+    // guarantees the fill. Floor at MIN_SELL_LIMIT_PRICE and snap to the tick grid.
+    let cross = std::cmp::max(
+        crate::config::ARB_FLATTEN_MIN_BID_BUFFER,
+        bid_price * crate::config::ARB_FLATTEN_BID_HAIRCUT_PCT,
+    );
+    let sell_price = crate::helpers::price::floor_to_tick_size(
+        (bid_price - cross).max(crate::config::MIN_SELL_LIMIT_PRICE)
+    );
 
     warn!(" ARB ARBITER [{}]: Flattening naked leg {} — FAK SELL {} @ {:.4} (bid={:.4}, entry={:.4})",
           strategy_name, filled_token, filled_shares, sell_price, bid_price, filled_avg_entry);
@@ -814,6 +840,11 @@ pub async fn arb_pair_fill_monitor(
             // The filled leg has been flattened — release its token claim so other
             // strategies aren't blocked on a position we no longer hold.
             token_ownership.lock().await.remove(&filled_market);
+            // Purge the filled leg's DB row too, so it can't linger as a phantom if the
+            // on-chain-keyed backstop races or misses it (defense in depth).
+            if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+                crate::helpers::db::close_open_position(&pool, &strategy_name, &filled_token.to_string()).await;
+            }
             // Record the realized result so the dashboard reflects the true (small) loss.
             crate::helpers::metrics::record_trade(
                 &asset,

@@ -565,6 +565,8 @@ fn build_snapshot(
         funding_rate: dec!(0), oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0),
         hist_vol: dec!(0),
         institutional_pulse: dec!(0), tide_coherence: dec!(0),
+        tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+        vix_proxy: dec!(0), vix_velocity: dec!(0),
         oi_delta_pct: dec!(0), cvd_ratio: dec!(0),
         secs_to_expiry: 0, timestamp: Utc::now(),
     }
@@ -775,7 +777,7 @@ async fn sync_dashboard(venue: &UsRetailVenue, pool: &sqlx::SqlitePool, starting
         positions_value += p.shares * p.avg_price;
     }
     // Drop rows for positions the venue no longer reports (settled to cash).
-    let _ = db::purge_stale_open_positions(pool, &live_ids).await;
+    let _ = db::purge_stale_open_positions(pool, &live_ids, &std::collections::HashMap::new()).await;
 
     let total = collateral + positions_value;
     db::record_pnl_snapshot(pool, total - starting, collateral, total).await;
